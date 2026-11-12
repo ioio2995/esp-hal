@@ -32,9 +32,10 @@ cargo xtask build qa esp32c6 sdio-a1-c6-slave
 cargo xtask build qa esp32p4 sdio-a1-p4-host
 ```
 
-The ELF files are written to
-`examples/qa/target/riscv32imac-unknown-none-elf/release/sdio-a1-c6-slave` and
-`examples/qa/target/riscv32imafc-unknown-none-elf/release/sdio-a1-p4-host`. Both builds select the
+The ELF files are written under the repository `target/` directory, to
+`target/riscv32imac-unknown-none-elf/release/sdio-a1-c6-slave` and
+`target/riscv32imafc-unknown-none-elf/release/sdio-a1-p4-host`. Check that the source SHA is embedded
+(`strings -a <elf> | grep <sha>`); a build made without the variable prints `sha=unknown`. Both builds select the
 `esp-println/uart` console through the `//% FEATURES` annotation. Record the `sha256sum` of both
 ELF files in the evidence folder. Build a given trial from a clean checkout of the reviewed SHA;
 do not edit the sources between the build and the run.
@@ -102,11 +103,11 @@ or the repository `cargo xtask run` flow); neither was tried against this board.
    2. Reset the C6 (EN button if the board has one, otherwise a power cycle). Strapping is sampled
       at reset, so GPIO9 must be low at that moment.
    3. Flash the C6 ELF over the CP2102:
-      `espflash flash --chip esp32c6 --port <C6_PORT> examples/qa/target/riscv32imac-unknown-none-elf/release/sdio-a1-c6-slave`.
+      `espflash flash --chip esp32c6 --port <C6_PORT> target/riscv32imac-unknown-none-elf/release/sdio-a1-c6-slave`.
    4. Remove the GPIO9 → GND link.
    5. Reset the C6 again and open the C6 console. Expect the `BOOT` line of section 4.
 2. **Programming the P4.** Flash the P4 ELF through its own programming path:
-   `espflash flash --chip esp32p4 --port <P4_PORT> examples/qa/target/riscv32imafc-unknown-none-elf/release/sdio-a1-p4-host`.
+   `espflash flash --chip esp32p4 --port <P4_PORT> target/riscv32imafc-unknown-none-elf/release/sdio-a1-p4-host`.
    Open the P4 console before releasing the P4 reset, so that the start-up lines are not lost.
 3. **Run.** The P4 firmware drives GPIO54 low immediately, then runs the campaign, then parks. The
    C6 firmware stays in its monitor loop. Both logs go to the evidence folder, one file per run.
