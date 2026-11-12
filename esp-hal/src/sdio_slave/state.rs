@@ -15,9 +15,14 @@ pub enum State {
     /// to the controller, so the host cannot see the card.
     ControllerReady,
     /// The SDIO pads are routed to the controller and the function-ready bits
-    /// are cleared: a host may enumerate the card (CMD5, CCCR, CIS). No
-    /// function is ready to transfer data.
-    BusEnumerable,
+    /// `IOREADY1/2` are cleared. The clock is running and the block is out of
+    /// reset.
+    ///
+    /// This state only describes what the driver has configured. It does **not**
+    /// mean that a host can enumerate the card: CMD5, CCCR and CIS access have
+    /// not been demonstrated on hardware. No function is ready to transfer
+    /// data.
+    BusExposed,
 }
 
 /// State of one SDIO I/O function, as observable on the bus.
@@ -50,14 +55,14 @@ impl State {
     pub const fn can_transition_to(self, next: State) -> bool {
         matches!(
             (self, next),
-            (State::ControllerReady, State::BusEnumerable)
-                | (State::BusEnumerable, State::ControllerReady)
+            (State::ControllerReady, State::BusExposed)
+                | (State::BusExposed, State::ControllerReady)
         )
     }
 
     /// Whether the SDIO pads are routed to the controller in this state.
     pub const fn pads_routed(self) -> bool {
-        matches!(self, State::BusEnumerable)
+        matches!(self, State::BusExposed)
     }
 
     /// Value of the function-ready bits (`IOREADY1`, `IOREADY2`) that the

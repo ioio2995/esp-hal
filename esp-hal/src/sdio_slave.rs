@@ -1,10 +1,11 @@
 //! # ESP32-C6 native SDIO Slave — hardware bring-up (A1)
 //!
-//! This module initialises the SDIO Slave controller so that an SDIO host can
-//! **enumerate** the card. It is **not** a working SDIO Slave driver: there is
-//! no DMA, no interrupt handling, and no data transfer. The driver never
-//! declares an I/O function as ready (`IOR1`/`IOR2` stay 0), so a host cannot
-//! start transferring data.
+//! This module clocks the SDIO Slave controller and exposes its pads, which is
+//! the prerequisite for a host to enumerate the card. Whether a host actually
+//! can has **not** been demonstrated on hardware. It is **not** a working SDIO
+//! Slave driver: there is no DMA, no interrupt handling, and no data transfer.
+//! The driver never declares an I/O function as ready (`IOR1`/`IOR2` stay 0),
+//! so a host cannot start transferring data.
 //!
 //! The register blocks used are `HINF`, `SLC` and `SLCHOST`, described by the
 //! ESP32-C6 TRM, chapter "SDIO Slave Controller".
@@ -14,7 +15,7 @@
 //! | Notion | Where it comes from |
 //! |---|---|
 //! | Controller initialised | [`State::ControllerReady`] |
-//! | Card enumerable | [`State::BusEnumerable`] |
+//! | Bus exposed (not proven enumerable) | [`State::BusExposed`] |
 //! | Function enabled by the host | [`SdioSlave::function1`] / [`SdioSlave::function2`] report [`FunctionState::EnabledByHost`] |
 //! | Function ready to transfer | [`FunctionState::Ready`], never reached by this driver |
 //!
@@ -22,14 +23,26 @@
 //!
 //! [`SdioSlave::new`] takes the peripheral clock (reference counted, the block
 //! is reset the first time) and nothing else: the pads are not routed and no
-//! function register is written. [`SdioSlave::enable_bus`] clears the
-//! function-ready bits, then routes the six SDIO pads. [`SdioSlave::disable_bus`]
-//! gives the pads back.
+//! function register is written.
 //!
-//! Dropping the driver gives the pads back if they are routed, then releases
-//! the clock. It is **not** a complete hardware shutdown once DMA exists: a
-//! future DMA layer must stop and drain the engine before the clock is
-//! released. The clock guard is the last field of the struct for that reason.
+//! [`SdioSlave::enable_bus`] clears the function-ready bits, puts each pad in a
+//! defined GPIO state (output disabled, pad hold released, GPIO matrix output
+//! on plain GPIO), then selects IO MUX function 0 with input enabled. The
+//! controller keeps control of the signal directions: the driver never forces an
+//! output enable.
+//!
+//! [`SdioSlave::disable_bus`] clears the function-ready bits again, then puts
+//! each pad back in the same defined GPIO state: output disabled, input
+//! disabled, hold released, GPIO function selected. The pull resistors are not
+//! touched. **The configuration the pads had before `enable_bus` is not saved
+//! and is not restored.** The clock is kept and the block is not reset.
+//!
+//! Dropping the driver does what `disable_bus` does if the pads are routed, then
+//! releases the clock reference. The clock is only gated when the last reference
+//! goes away. Neither operation stops a DMA engine, because none exists yet:
+//! a future DMA layer must stop and drain it **before** the pads are released
+//! and before the clock is. The clock guard is the last field of the struct for
+//! that reason.
 //!
 //! ## Pins
 //!
@@ -98,6 +111,8 @@ impl<'d> Pins<'d> {
 pub struct RegisterSnapshot {
     /// `HINF_CFG_DATA1_REG` (CCCR configuration and status).
     pub cfg_data1: u32,
+    /// `HINF_CFG_DATA7_REG` (function 0 ready, interrupt and capability bits).
+    pub cfg_data7: u32,
     /// `HINF_CONF_STATUS_REG` (function 0 configuration status).
     pub function0_status: u32,
     /// `SDIO_SLC0INT_RAW_REG`: SLC0 raw interrupt status.
@@ -147,20 +162,24 @@ impl<'d> SdioSlave<'d> {
         self.state
     }
 
-    /// Makes the card visible to an SDIO host.
+    /// Exposes the SDIO controller on the bus.
     ///
     /// 1. Clears `IOREADY1` and `IOREADY2` (no function is ready).
-    /// 2. Routes the six pads to the controller (IO MUX function 0).
+    /// 2. Puts each pad in a defined state: output disabled, hold released,
+    ///    GPIO matrix output on plain GPIO.
+    /// 3. Selects IO MUX function 0 on the six pads and enables their input.
+    ///    The output direction of the pads is left to the controller.
     ///
     /// The CCCR, FBR and CIS keep their reset values, and the interrupts and
-    /// DMA are not touched.
+    /// DMA are not touched. A successful return does not prove that a host can
+    /// enumerate the card.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidState`] unless the state is
     /// [`State::ControllerReady`].
     pub fn enable_bus(&mut self) -> Result<(), Error> {
-        let next = State::BusEnumerable;
+        let next = State::BusExposed;
         if !self.state.can_transition_to(next) {
             return Err(Error::InvalidState);
         }
@@ -168,6 +187,9 @@ impl<'d> SdioSlave<'d> {
         self.clear_function_ready();
 
         for pad in &self.pads {
+            // Known starting point: no output forced by the GPIO matrix, hold
+            // released. Then hand the pad over to the controller.
+            pad.init_gpio();
             pad.set_alternate_function(AlternateFunction::_0);
             pad.set_input_enable(true);
         }
@@ -176,18 +198,24 @@ impl<'d> SdioSlave<'d> {
         Ok(())
     }
 
-    /// Takes the card off the bus: the pads go back to plain GPIO inputs.
+    /// Takes the card off the bus.
+    ///
+    /// Clears `IOREADY1/2`, then puts the pads back in a defined GPIO state
+    /// (output and input disabled, hold released). The previous pad
+    /// configuration is not restored, the pulls are not changed, the clock is
+    /// kept and the block is not reset.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidState`] unless the state is
-    /// [`State::BusEnumerable`].
+    /// [`State::BusExposed`].
     pub fn disable_bus(&mut self) -> Result<(), Error> {
         let next = State::ControllerReady;
         if !self.state.can_transition_to(next) {
             return Err(Error::InvalidState);
         }
 
+        self.clear_function_ready();
         self.release_pads();
         self.state = next;
         Ok(())
@@ -214,6 +242,7 @@ impl<'d> SdioSlave<'d> {
     pub fn snapshot(&self) -> RegisterSnapshot {
         RegisterSnapshot {
             cfg_data1: HINF::regs().cfg_data1().read().bits(),
+            cfg_data7: HINF::regs().cfg_data7().read().bits(),
             function0_status: HINF::regs().conf_status().read().bits(),
             slc0_interrupt_raw: SLC::regs().slc0int_raw().read().bits(),
             slc1_interrupt_raw: SLC::regs().slc1int_raw().read().bits(),
@@ -238,6 +267,7 @@ impl<'d> SdioSlave<'d> {
 impl Drop for SdioSlave<'_> {
     fn drop(&mut self) {
         if self.state.pads_routed() {
+            self.clear_function_ready();
             self.release_pads();
         }
     }

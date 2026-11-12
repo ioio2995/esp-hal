@@ -1,6 +1,6 @@
 use super::state::*;
 
-const STATES: [State; 2] = [State::ControllerReady, State::BusEnumerable];
+const STATES: [State; 2] = [State::ControllerReady, State::BusExposed];
 
 #[test]
 fn function_ready_is_never_allowed() {
@@ -10,9 +10,9 @@ fn function_ready_is_never_allowed() {
 }
 
 #[test]
-fn only_bus_enumerable_routes_pads() {
+fn only_bus_exposed_routes_pads() {
     assert!(!State::ControllerReady.pads_routed());
-    assert!(State::BusEnumerable.pads_routed());
+    assert!(State::BusExposed.pads_routed());
 }
 
 #[test]
