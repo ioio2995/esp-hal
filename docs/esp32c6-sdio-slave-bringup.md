@@ -174,6 +174,9 @@ Compile for `riscv32imac-unknown-none-elf` with and without `unstable`, and with
 `defmt`; fmt; clippy; `xtask check`; rustdoc; host tests of `state.rs` in
 `esp-hal-host-tests`. A software pass is not a hardware pass.
 
+The firmwares and the operator recipe for this qualification are described in
+`docs/esp32c6-sdio-a1-qualification.md` (prepared, not executed).
+
 ### Hardware qualification (not performed)
 
 1. `enable_bus` then `snapshot()`: no hang; `cfg_data1` bits 0 and 4 set, bits 1 and
