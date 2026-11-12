@@ -35,15 +35,15 @@ pub struct RegisterSnapshot {
 ///
 /// This is a bring-up helper. It does not turn on the hardware and must not
 /// be used as a substitute for a configured DMA/interrupt-driven driver.
-pub struct SdioSlaveRegisters {
-    _hinf: HINF,
-    _slc: SLC,
-    _slchost: SLCHOST,
+pub struct SdioSlaveRegisters<'d> {
+    _hinf: HINF<'d>,
+    _slc: SLC<'d>,
+    _slchost: SLCHOST<'d>,
 }
 
-impl SdioSlaveRegisters {
+impl<'d> SdioSlaveRegisters<'d> {
     /// Acquires the hardware register blocks without modifying any registers.
-    pub fn new(hinf: HINF, slc: SLC, slchost: SLCHOST) -> Self {
+    pub fn new(hinf: HINF<'d>, slc: SLC<'d>, slchost: SLCHOST<'d>) -> Self {
         Self {
             _hinf: hinf,
             _slc: slc,
