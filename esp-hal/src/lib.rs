@@ -425,6 +425,8 @@ unstable_driver! {
     pub mod rsa;
     #[cfg(sdmmc_driver_supported)]
     pub mod sdmmc;
+    #[cfg(esp32c6)]
+    pub mod sdio_slave;
     #[cfg(sha_driver_supported)]
     pub mod sha;
     #[cfg(sdm_driver_supported)]
