@@ -3,4 +3,5 @@
 #![cfg(test)]
 
 mod ipc;
+mod sdio_a1;
 mod sdio_slave;
