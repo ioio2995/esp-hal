@@ -3,3 +3,4 @@
 #![cfg(test)]
 
 mod ipc;
+mod p4_en;
