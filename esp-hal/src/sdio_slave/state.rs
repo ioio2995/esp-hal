@@ -23,6 +23,12 @@ pub enum State {
     /// not been demonstrated on hardware. No function is ready to transfer
     /// data.
     BusExposed,
+    /// (A2a) The SLC0 receive DMA (host to slave) is armed with a linked list and
+    /// a buffer, and the driver may declare function 1 ready. The pads are routed.
+    ///
+    /// Only the host to slave direction exists in this state: there is no slave to
+    /// host DMA, no interrupt handling and no flow control.
+    Function1Receiving,
 }
 
 /// State of one SDIO I/O function, as observable on the bus.
@@ -48,6 +54,9 @@ pub enum FunctionState {
 pub enum Error {
     /// The operation is not allowed in the current [`State`].
     InvalidState,
+    /// A DMA buffer is empty, not word-sized, or larger than one descriptor can
+    /// describe (the size field is 14 bits wide).
+    InvalidBuffer,
 }
 
 impl State {
@@ -57,19 +66,22 @@ impl State {
             (self, next),
             (State::ControllerReady, State::BusExposed)
                 | (State::BusExposed, State::ControllerReady)
+                | (State::BusExposed, State::Function1Receiving)
+                | (State::Function1Receiving, State::BusExposed)
+                | (State::Function1Receiving, State::ControllerReady)
         )
     }
 
     /// Whether the SDIO pads are routed to the controller in this state.
     pub const fn pads_routed(self) -> bool {
-        matches!(self, State::BusExposed)
+        matches!(self, State::BusExposed | State::Function1Receiving)
     }
 
-    /// Value of the function-ready bits (`IOREADY1`, `IOREADY2`) that the
-    /// driver requires in this state. It is `false` in every state: advertising
-    /// a function as ready needs DMA buffers, which the bring-up driver lacks.
+    /// Whether the driver may declare a function ready (`IOREADY1`) in this
+    /// state. Advertising a function as ready needs DMA buffers, which only
+    /// [`State::Function1Receiving`] has.
     pub const fn function_ready_allowed(self) -> bool {
-        false
+        matches!(self, State::Function1Receiving)
     }
 }
 

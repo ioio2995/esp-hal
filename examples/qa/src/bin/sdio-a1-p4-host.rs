@@ -57,6 +57,7 @@ use esp_backtrace as _;
 use esp_hal::{
     Blocking,
     delay::Delay,
+    dma::aligned::DmaAlignedMut,
     gpio::{Level, Output, OutputConfig},
     main,
     sdmmc::{
@@ -107,6 +108,9 @@ const BOOT_WAIT_MS: u32 = parse_u32(option_env!("SDIO_A1_BOOT_WAIT_MS"), 2000);
 const CMD5_TRIES: u32 = parse_u32(option_env!("SDIO_A1_CMD5_TRIES"), 10);
 const CMD5_RETRY_MS: u32 = parse_u32(option_env!("SDIO_A1_CMD5_RETRY_MS"), 200);
 const ROUNDS: u32 = parse_u32(option_env!("SDIO_A1_ROUNDS"), 1);
+/// Build-time switch `SDIO_A2=1`: after the A1 enumeration, enable function 1 and write one packet with CMD53 (A2a).
+/// With it, this firmware is no longer "writes=none".
+const A2: u32 = parse_u32(option_env!("SDIO_A2"), 0);
 const ROUND_GAP_MS: u32 = parse_u32(option_env!("SDIO_A1_ROUND_GAP_MS"), 500);
 const CLOCK_HZ: u32 = parse_u32(option_env!("SDIO_A1_CLOCK_HZ"), 400_000);
 
@@ -219,6 +223,106 @@ fn cmd52_read(slot: &mut HostSlot<'_>, function: u8, addr: u32) -> Result<u8, Re
         return Err(ReadError::R5Flags(r5.flags));
     }
     Ok(r5.data)
+}
+
+/// Writes one byte of function `function` with CMD52 and returns the R5 data byte (A2 only).
+fn cmd52_write(slot: &mut HostSlot<'_>, function: u8, addr: u32, data: u8) -> Result<u8, ReadError> {
+    let cmd = sdio::sdio::Cmd52 {
+        write: true,
+        function,
+        raw: false,
+        addr,
+        data,
+    };
+    let r5 = exec(slot, &cmd).map_err(|e| ReadError::Host(error_name(&e)))?;
+    if r5.flags & sdio::SdioError::ALL != 0 {
+        return Err(ReadError::R5Flags(r5.flags));
+    }
+    Ok(r5.data)
+}
+
+/// CMD53 argument: R/W, function, block mode, op code (1 = incrementing address), register address, count.
+fn cmd53_arg(write: bool, function: u8, block: bool, incrementing: bool, addr: u32, count: u32) -> u32 {
+    (write as u32) << 31
+        | ((function as u32) & 7) << 28
+        | (block as u32) << 27
+        | (incrementing as u32) << 26
+        | (addr & 0x1_ffff) << 9
+        | (count & 0x1ff)
+}
+
+/// 64-byte aligned, 64-byte long DMA buffer (the P4 data cache line is 64 bytes).
+#[repr(C, align(64))]
+struct Dma64([u8; 64]);
+
+/// Reads a 32-bit little-endian value of function 1 with four CMD52 reads (A2 only).
+fn read_fn1_u32(slot: &mut HostSlot<'_>, addr: u32) -> Result<u32, ReadError> {
+    let mut value = 0u32;
+    for i in 0..4 {
+        value |= (cmd52_read(slot, 1, addr + i)? as u32) << (8 * i);
+    }
+    Ok(value)
+}
+
+/// A2a: enable function 1, wait for IOR1, read the receive token, send one 64-byte packet with CMD53.
+///
+/// The packet goes to the incrementing-address window: start address `0x1F800 - length` (TRM 34.5.5.3), byte mode.
+fn h6_function1(slot: &mut HostSlot<'_>, delay: &Delay, tally: &mut HostTally) {
+    match cmd52_write(slot, 0, 0x02, 0x02) {
+        Ok(echo) => a1!(tally, "A2_IOE1", Outcome::Pass, "CCCR IOE written 0x02 r5_data={:#04x}", echo),
+        Err(e) => {
+            a1!(tally, "A2_IOE1", Outcome::Fail, "{}", describe(e));
+            return;
+        }
+    }
+    let mut ior = 0u8;
+    for attempt in 1..=40u32 {
+        ior = cmd52_read(slot, 0, 0x03).unwrap_or(0xff);
+        if ior & 0x02 != 0 {
+            a1!(tally, "A2_IOR1", Outcome::Pass, "IOR={:#04x} after {} polls", ior, attempt);
+            break;
+        }
+        delay.delay_millis(50);
+    }
+    if ior & 0x02 == 0 {
+        a1!(tally, "A2_IOR1", Outcome::Fail, "IOR={:#04x}: function 1 never became ready in 2 s", ior);
+        return;
+    }
+    match read_fn1_u32(slot, 0x44) {
+        Ok(token) => a1!(tally, "A2_TOKEN", Outcome::Info, "SLCHOST_SLC0HOST_TOKEN_RDATA raw={:#010x}", token),
+        Err(e) => a1!(tally, "A2_TOKEN", Outcome::Fail, "{}", describe(e)),
+    }
+
+    let mut buffer = Dma64([0; 64]);
+    for (i, byte) in buffer.0.iter_mut().enumerate() {
+        *byte = 0xA0u8.wrapping_add(i as u8);
+    }
+    let length = 64u32;
+    let arg = cmd53_arg(true, 1, false, true, 0x1_f800 - length, length);
+    let dma = match DmaAlignedMut::new(&mut buffer.0) {
+        Ok(dma) => dma.unsize(),
+        Err(_) => {
+            a1!(tally, "A2_CMD53_WRITE", Outcome::Fail, "buffer is not DMA aligned");
+            return;
+        }
+    };
+    match slot.write_blocks_blocking(53, arg, dma, length as u16, 1) {
+        Ok(words) => {
+            let flags = ((words[0] >> 8) & 0xff) as u8;
+            if flags & sdio::SdioError::ALL != 0 {
+                a1!(tally, "A2_CMD53_WRITE", Outcome::Fail, "r5_flags={:#04x} arg={:#010x}", flags, arg);
+            } else {
+                a1!(tally, "A2_CMD53_WRITE", Outcome::Pass, "{} bytes to function 1 at {:#07x} arg={:#010x} r5_flags={:#04x} (host side only; the C6 log shows the receive)",
+                    length, 0x1_f800 - length, arg, flags);
+            }
+        }
+        Err(e) => a1!(tally, "A2_CMD53_WRITE", Outcome::Fail, "error={} arg={:#010x}", error_name(&e), arg),
+    }
+    // Interrupt status as the host sees it (information only).
+    match read_fn1_u32(slot, 0x58) {
+        Ok(v) => a1!(tally, "A2_INT_ST", Outcome::Info, "SLCHOST_SLC0HOST_INT_ST raw={:#010x}", v),
+        Err(e) => a1!(tally, "A2_INT_ST", Outcome::Fail, "{}", describe(e)),
+    }
 }
 
 /// Prints the reason of a failed read.
@@ -705,6 +809,9 @@ fn run_round(
             let name = if function == 1 { "CIS_FN1" } else { "CIS_FN2" };
             h5_cis(slot, &mut tally, name, fbr.cis_ptr());
         }
+    }
+    if A2 != 0 {
+        h6_function1(slot, delay, &mut tally);
     }
     tally
 }
