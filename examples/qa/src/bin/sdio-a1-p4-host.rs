@@ -70,6 +70,7 @@ use esp_hal::{
         Slot,
         SlotConfig,
     },
+    uart::{Config as UartConfig, Uart},
 };
 use esp_println::println;
 use qa_test::sdio_a1::{
@@ -722,6 +723,13 @@ fn main() -> ! {
     let mut reset = C6Reset {
         en: Output::new(peripherals.GPIO54, Level::Low, OutputConfig::default()),
     };
+
+    // Console: with the factory ESP-IDF bootloader of the Waveshare board, the ROM output used by `esp-println` stays silent until
+    // UART0 has been set up by the esp-hal driver (observed with the p4-hello diagnostic, 2026-11-13). Keep the driver alive; it
+    // does not touch GPIO54.
+    let _console = Uart::new(peripherals.UART0, UartConfig::default().with_baudrate(115_200))
+        .ok()
+        .map(|uart| uart.with_tx(peripherals.GPIO37));
 
     println!(
         "SDIO-A1 P4 BOOT INFO run={} sha={} fw=sdio-a1-p4-host scope=A1 mode=1bit hz={} slot=1 \
