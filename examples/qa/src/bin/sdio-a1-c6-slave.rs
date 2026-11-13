@@ -39,6 +39,7 @@ use esp_hal::{
     delay::Delay,
     main,
     sdio_slave::{FunctionState, Pins, RegisterSnapshot, SdioSlave, State},
+    uart::{Config as UartConfig, Uart},
 };
 use esp_println::println;
 use qa_test::sdio_a1::{Outcome, ioenable_bits, ioready_bits, parse_u32};
@@ -101,6 +102,12 @@ fn check_ioready(step: &str, s: &RegisterSnapshot) -> bool {
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     let delay = Delay::new();
+
+    // Console: set UART0 up through the esp-hal driver (needed behind the factory ESP-IDF bootloader on the P4, see
+    // sdio-a1-p4-host). TX = GPIO16, the pin wired to the H7 console header. Does not touch the SDIO pads GPIO18..23.
+    let _console = Uart::new(peripherals.UART0, UartConfig::default().with_baudrate(115_200))
+        .ok()
+        .map(|uart| uart.with_tx(peripherals.GPIO16));
 
     a1!(
         "BOOT",
