@@ -88,8 +88,9 @@ side uses the fixed IO MUX function 0 pads.
 
 ### P4 console
 
-`esp-println/uart` prints on UART0 of the P4. The path from the P4 UART0 to a host serial port on
-this board (on-board USB bridge or header) is **not verified here**; read it on the schematic.
+`esp-println/uart` prints on UART0 of the P4, reached through the on-board CH343 bridge (`1a86:55d3`);
+115200 baud is the only rate observed to be reliable. The bridge is a different USB port from the native
+download port (`303a:0012`).
 
 ## 3. Programming procedure (not executed)
 
@@ -106,9 +107,11 @@ or the repository `cargo xtask run` flow); neither was tried against this board.
       `espflash flash --chip esp32c6 --port <C6_PORT> target/riscv32imac-unknown-none-elf/release/sdio-a1-c6-slave`.
    4. Remove the GPIO9 → GND link.
    5. Reset the C6 again and open the C6 console. Expect the `BOOT` line of section 4.
-2. **Programming the P4.** Flash the P4 ELF through its own programming path:
-   `espflash flash --chip esp32p4 --port <P4_PORT> target/riscv32imafc-unknown-none-elf/release/sdio-a1-p4-host`.
-   Open the P4 console before releasing the P4 reset, so that the start-up lines are not lost.
+2. **Programming the P4.** Do **not** use the default `espflash flash` layout (bootloader, table and application at
+   0x10000): it would replace the factory partition table and overwrite `nvsfactory`/`nvs`. Write only the
+   application-only image at **0x110000** described in `docs/esp32p4-waveshare-flash-layout.md` (factory bootloader and
+   table kept), through the programming path approved for the trial (IOBEWI Device Lab, native USB). Open the P4
+   console on the UART bridge before releasing the P4 from download mode, so that the start-up lines are not lost.
 3. **Run.** The P4 firmware drives GPIO54 low immediately, then runs the campaign, then parks. The
    C6 firmware stays in its monitor loop. Both logs go to the evidence folder, one file per run.
 

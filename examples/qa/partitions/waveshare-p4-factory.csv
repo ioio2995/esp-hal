@@ -1,0 +1,9 @@
+# Identique a la table d'usine lue dans la sauvegarde (offset 0x8000) :
+# seul le contenu de "factory" (0x110000) est remplace par ce firmware.
+# Name,     Type, SubType, Offset,   Size
+nvsfactory, data, nvs,     0x9000,   200K
+nvs,        data, nvs,     0x3b000,  840K
+otadata,    data, ota,     0x10d000, 8K
+phy_init,   data, phy,     0x10f000, 4K
+factory,    app,  factory, 0x110000, 9M
+storage,    data, spiffs,  0xa10000, 5M
