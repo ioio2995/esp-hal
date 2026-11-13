@@ -2,6 +2,8 @@
 
 #![no_std]
 
+pub mod sdio_a1;
+
 use core::ops::Range;
 
 use esp_bootloader_esp_idf::partitions;
