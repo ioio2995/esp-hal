@@ -4,7 +4,8 @@
 Not a qualification recipe. Safety kept: manifest regions only, ONE flash.write (images written in the given order), no retry,
 no restoration, local grant armed by the operator, stop at the first error.
 
-Usage: python dev_flash_multi.py <manifest.json> <device> <addr:file:sha256> [<addr:file:sha256> ...]
+Usage: python dev_flash_multi.py <manifest.json> <device> [--erase] <addr:file:sha256> [<addr:file:sha256> ...]
+--erase: chip erase before writing (the manifest must cover the whole flash); afterwards three sample sectors are read and must be 0xFF.
 """
 import hashlib, json, sys, time
 from pathlib import Path
@@ -24,13 +25,16 @@ def say(msg):
 def main():
     manifest = CampaignManifest(json.loads(Path(sys.argv[1]).read_text()))
     device = sys.argv[2]
+    erase = '--erase' in sys.argv[3:]
     plan = []
-    for spec in sys.argv[3:]:
+    for spec in [a for a in sys.argv[3:] if a != '--erase']:
         addr, path, want = spec.split(':')
         data = Path(path).read_bytes()
         assert hashlib.sha256(data).hexdigest() == want, 'image %s does not match its SHA-256' % path
         manifest.check_region(device, int(addr, 0), len(data))
         plan.append((int(addr, 0), data, want))
+    if erase:
+        manifest.check_region(device, 0, 8 * 1024 * 1024)
     config = json.loads((ROOT / 'tokens.json').read_text())
     keys = [k for k, w in config.items() if w.get('id') == 'claude' and w.get('role') == 'client']
     assert len(keys) == 1, 'ambiguous client token'
@@ -47,9 +51,9 @@ def main():
         assert state['privileged_seconds'] >= 150, 'local grant too short'
         arts = [client.upload(d) for _, d, _ in plan]
         say('writing %s in ONE flash.write' % ', '.join('%d B at %#x' % (len(d), a) for a, d, _ in plan))
-        result = board.command('flash.write', {'chip': state['chip'], 'return_console': False,
+        result = board.command('flash.write', {'chip': state['chip'], 'return_console': False, 'erase': erase,
             'images': [{'address': a, 'artifact': art['id'], 'sha256': art['sha256']} for (a, _, _), art in zip(plan, arts)]},
-            timeout=90, allow_destructive=True)
+            timeout=150 if erase else 90, allow_destructive=True)
         say('DONE: %s' % json.dumps(result.get('verification')))
         written_op = board.last_operation
         for a, d, _ in plan:
@@ -57,6 +61,12 @@ def main():
             say('read-back %#x (%d B): %s' % (a, len(d), 'identical' if back == d else 'DIFFERS'))
             if back != d:
                 raise RuntimeError('read-back mismatch at %#x' % a)
+        if erase:
+            for a in (0x40000, 0x190000, 0x7ff000):
+                blank = board.read_flash(address=a, size=4096, timeout=60, return_console=False)
+                say('erase check %#x: %s' % (a, 'all 0xFF' if blank == b'\xff' * 4096 else 'NOT BLANK'))
+                if blank != b'\xff' * 4096:
+                    raise RuntimeError('region %#x is not blank after the chip erase' % a)
         board.close()
         say('reservation released; OPERATOR: revoke the local grant ...')
         end = time.monotonic() + 120
