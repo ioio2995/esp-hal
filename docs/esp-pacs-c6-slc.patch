@@ -360,6 +360,3 @@ index 00000000..293fa0c5
 +    });
 +    assert_eq!(reg.read().bits(), 0x7fff);
 +}
--- 
-2.52.0
-
