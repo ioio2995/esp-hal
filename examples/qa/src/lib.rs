@@ -2,6 +2,8 @@
 
 #![no_std]
 
+pub mod p4_en;
+
 use core::ops::Range;
 
 use esp_bootloader_esp_idf::partitions;
