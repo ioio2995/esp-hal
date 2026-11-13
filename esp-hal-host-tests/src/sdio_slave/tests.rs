@@ -1,9 +1,11 @@
 use super::state::*;
 
-const STATES: [State; 3] = [
+const STATES: [State; 5] = [
     State::ControllerReady,
     State::BusExposed,
     State::Function1Receiving,
+    State::Function1Received,
+    State::Function1ReceiveError,
 ];
 
 #[test]
@@ -31,7 +33,11 @@ fn transitions_are_limited_to_the_documented_graph() {
         (ControllerReady, BusExposed),
         (BusExposed, ControllerReady),
         (BusExposed, Function1Receiving),
-        (Function1Receiving, BusExposed),
+        (Function1Receiving, Function1Received),
+        (Function1Receiving, Function1ReceiveError),
+        (Function1Received, ControllerReady),
+        (Function1Received, Function1ReceiveError),
+        (Function1ReceiveError, ControllerReady),
         (Function1Receiving, ControllerReady),
     ];
     for from in STATES {
@@ -75,4 +81,29 @@ fn only_the_receiving_state_can_yield_a_ready_function() {
 fn error_is_comparable() {
     assert_eq!(Error::InvalidState, Error::InvalidState);
     assert_ne!(Error::InvalidState, Error::InvalidBuffer);
+}
+
+#[test]
+fn stop_waits_for_idle_and_reports_timeout() {
+    let mut polls = 0;
+    assert!(wait_for_idle(|| {
+        polls += 1;
+        polls == 4
+    }));
+    assert_eq!(polls, 4);
+    let mut polls = 0;
+    assert!(!wait_for_idle(|| {
+        polls += 1;
+        false
+    }));
+    assert_eq!(polls, 10_000);
+}
+
+#[test]
+fn token_no_replace_sets_bit_zero_without_changing_other_bits() {
+    for bits in [0, 2, 0x0203_701a, u32::MAX] {
+        let updated = super::receive::token_no_replace(bits);
+        assert_eq!(updated & 1, 1);
+        assert_eq!(updated & !1, bits & !1);
+    }
 }

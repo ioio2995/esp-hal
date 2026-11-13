@@ -1,67 +1,27 @@
-//! # ESP32-C6 native SDIO Slave — bring-up (A1) and first receive path (A2a)
+//! # ESP32-C6 SDIO Slave: A1 enumeration and A2a host-to-slave reception
 //!
-//! **A2a (not hardware-validated yet):** [`SdioSlave::arm_receive`] mounts one SLC0 receive
-//! descriptor (host to slave, I/O function 1, incremental-address packets) and
-//! [`SdioSlave::set_function1_ready`] then declares function 1 ready. A packet that the host writes
-//! with CMD53 at address `0x1F800 - length` lands in the buffer; [`SdioSlave::poll_received`]
-//! reports its length. There is still no slave to host DMA, no interrupt handling and no flow
-//! control. The text below describes A1 and stays true for [`State::BusExposed`].
+//! One descriptor receives one incremental-address packet on SLC0. The host
+//! writes CMD53 to `0x1F800 - length`, after function 1 is enabled and ready.
+//! Slave-to-host DMA, interrupts, and automatic rearming are not implemented.
 //!
-//! This module clocks the SDIO Slave controller and exposes its pads, which is
-//! the prerequisite for a host to enumerate the card. Whether a host actually
-//! can has **not** been demonstrated on hardware. It is **not** a working SDIO
-//! Slave driver: there is no DMA, no interrupt handling, and no data transfer.
-//! The driver never declares an I/O function as ready (`IOR1`/`IOR2` stay 0),
-//! so a host cannot start transferring data.
+//! [`SdioSlave::arm_receive`] consumes exclusive static storage in internal RAM.
+//! Only a validated EOF with a parked DMA makes [`SdioSlave::received`] available.
+//! [`SdioSlave::disable_bus`] clears readiness and waits for DMA idle before
+//! releasing pads. [`SdioSlave::take_receive_buffers`] returns storage only after
+//! this stop succeeds. A stop timeout retains ownership and holds the FSM reset.
+//! If destruction cannot confirm idle, the clock reference and static storage
+//! are retained instead of permitting unsafe reuse.
 //!
-//! The register blocks used are `HINF`, `SLC` and `SLCHOST`, described by the
-//! ESP32-C6 TRM, chapter "SDIO Slave Controller".
+//! Pads use fixed IO MUX function 0: CMD GPIO18, CLK GPIO19, DATA0..3 GPIO20..23.
+//! Disabling the bus selects GPIO with input/output disabled. Previous pad
+//! settings are not restored; pull resistors are unchanged.
 //!
-//! ## States
-//!
-//! | Notion | Where it comes from |
-//! |---|---|
-//! | Controller initialised | [`State::ControllerReady`] |
-//! | Bus exposed (not proven enumerable) | [`State::BusExposed`] |
-//! | Function enabled by the host | [`SdioSlave::function1`] / [`SdioSlave::function2`] report [`FunctionState::EnabledByHost`] |
-//! | Function ready to transfer | [`FunctionState::Ready`], never reached by this driver |
-//!
-//! ## Lifecycle
-//!
-//! [`SdioSlave::new`] takes the peripheral clock (reference counted, the block
-//! is reset the first time) and nothing else: the pads are not routed and no
-//! function register is written.
-//!
-//! [`SdioSlave::enable_bus`] clears the function-ready bits, puts each pad in a
-//! defined GPIO state (output disabled, pad hold released, GPIO matrix output
-//! on plain GPIO), then selects IO MUX function 0 with input enabled. The
-//! controller keeps control of the signal directions: the driver never forces an
-//! output enable.
-//!
-//! [`SdioSlave::disable_bus`] clears the function-ready bits again, then puts
-//! each pad back in the same defined GPIO state: output disabled, input
-//! disabled, hold released, GPIO function selected. The pull resistors are not
-//! touched. **The configuration the pads had before `enable_bus` is not saved
-//! and is not restored.** The clock is kept and the block is not reset.
-//!
-//! Dropping the driver does what `disable_bus` does if the pads are routed, then
-//! releases the clock reference. The clock is only gated when the last reference
-//! goes away. Neither operation stops a DMA engine, because none exists yet:
-//! a future DMA layer must stop and drain it **before** the pads are released
-//! and before the clock is. The clock guard is the last field of the struct for
-//! that reason.
-//!
-//! ## Pins
-//!
-//! The SDIO pads are fixed IO MUX function 0 of GPIO18 (CMD), GPIO19 (CLK) and
-//! GPIO20..GPIO23 (DATA0..DATA3). The GPIO matrix cannot be used.
-//!
-//! ## Hardware status
-//!
-//! Nothing here has been qualified on hardware. See
-//! `docs/esp32c6-sdio-slave-bringup.md`.
+//! The implementation uses HINF, SLC and SLCHOST (ESP32-C6 TRM chapter 34).
+//! A1 enumeration and an A2a 64-byte transfer were reported by the developer.
+//! Those results do not qualify later source changes. See
+//! `docs/esp32c6-sdio-a2a.md` for the current contract and limitations.
 
-use core::ptr;
+use core::sync::atomic::{Ordering, compiler_fence};
 
 use crate::{
     gpio::{AlternateFunction, AnyPin, Pin},
@@ -69,8 +29,12 @@ use crate::{
     system::{Peripheral, PeripheralGuard},
 };
 
+mod receive;
 mod state;
 
+pub use receive::Descriptor;
+use receive::Receive;
+use state::wait_for_idle;
 pub use state::{Error, FunctionState, State};
 
 /// The six pads of the SDIO Slave bus.
@@ -113,37 +77,6 @@ impl<'d> Pins<'d> {
     }
 }
 
-/// One SDIO slave DMA linked-list descriptor (TRM 34.5.5.1): three words.
-///
-/// The layout is fixed by the hardware: `dw0` holds `owner` (bit 31), `eof` (bit 30), the valid
-/// `length` (bits 27:14) and the buffer `size` (bits 13:0); `buffer` is the word-aligned buffer
-/// address; `next` is the next descriptor or 0. It must live in memory the DMA can reach and must
-/// not move while the DMA owns it, hence the `'static` borrow taken by [`SdioSlave::arm_receive`].
-#[repr(C, align(4))]
-#[derive(Debug)]
-pub struct Descriptor {
-    dw0: u32,
-    buffer: u32,
-    next: u32,
-}
-
-impl Descriptor {
-    /// An empty descriptor, not owned by the DMA.
-    pub const fn new() -> Self {
-        Self {
-            dw0: 0,
-            buffer: 0,
-            next: 0,
-        }
-    }
-}
-
-impl Default for Descriptor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Raw view of the receive path, for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiveDiagnostics {
@@ -181,10 +114,10 @@ pub struct SdioSlave<'d> {
     _slchost: SLCHOST<'d>,
     pads: [AnyPin<'d>; 6],
     state: State,
-    rx_desc: Option<&'static mut Descriptor>,
-    rx_buffer: Option<&'static mut [u32]>,
+    receive: Option<Receive>,
+    receive_error: Option<Error>,
     // Dropped last: the clock must outlive every other resource.
-    _clock: PeripheralGuard,
+    _clock: Option<PeripheralGuard>,
 }
 
 impl<'d> SdioSlave<'d> {
@@ -208,9 +141,9 @@ impl<'d> SdioSlave<'d> {
                 pins.data3.degrade(),
             ],
             state: State::ControllerReady,
-            rx_desc: None,
-            rx_buffer: None,
-            _clock: clock,
+            receive: None,
+            receive_error: None,
+            _clock: Some(clock),
         }
     }
 
@@ -265,15 +198,17 @@ impl<'d> SdioSlave<'d> {
     /// # Errors
     ///
     /// Returns [`Error::InvalidState`] unless the pads are routed ([`State::BusExposed`] or
-    /// [`State::Function1Receiving`], whose receive DMA is stopped first).
+    /// [`State::Function1Receiving`], [`State::Function1Received`], or
+    /// [`State::Function1ReceiveError`]). [`Error::DmaStopTimeout`] if DMA does not
+    /// become idle. Storage, pads, and the clock remain owned on timeout.
     pub fn disable_bus(&mut self) -> Result<(), Error> {
         let next = State::ControllerReady;
         if !self.state.can_transition_to(next) {
             return Err(Error::InvalidState);
         }
 
-        self.stop_receive_dma();
         self.clear_function_ready();
+        self.stop_receive_dma()?;
         self.release_pads();
         self.state = next;
         Ok(())
@@ -321,7 +256,7 @@ impl<'d> SdioSlave<'d> {
     /// 2. Pulses the SLC0 TX (host to slave) FSM reset.
     /// 3. Writes the descriptor (`owner` = DMA, `eof` = 0, `length` = 0, `size` = buffer size).
     /// 4. Writes the descriptor address to `SDIO_SLC0TX_LINK_ADDR_REG` and sets `TXLINK_START`.
-    /// 5. Writes 1 to the SLC0 token register, so the host reads one available buffer in
+    /// 5. Adds one to the SLC0 token counter, so the host reads one more available buffer in
     ///    `SLCHOST_SLC0HOST_TOKEN_RDATA_REG`.
     ///
     /// The function is **not** declared ready here, see [`Self::set_function1_ready`].
@@ -329,7 +264,9 @@ impl<'d> SdioSlave<'d> {
     /// # Errors
     ///
     /// [`Error::InvalidState`] unless the state is [`State::BusExposed`]; [`Error::InvalidBuffer`]
-    /// if the buffer is empty or larger than 16380 bytes.
+    /// if the buffer is empty or larger than 16380 bytes. [`Error::UnsupportedMemory`]
+    /// if either allocation is outside internal RAM. Existing storage must be
+    /// reclaimed with [`Self::take_receive_buffers`] before a new arm.
     pub fn arm_receive(
         &mut self,
         descriptor: &'static mut Descriptor,
@@ -339,10 +276,22 @@ impl<'d> SdioSlave<'d> {
         if !self.state.can_transition_to(next) || self.state != State::BusExposed {
             return Err(Error::InvalidState);
         }
-        let size = buffer.len() * 4;
-        if buffer.is_empty() || size > 0x3ffc {
+        if self.receive.is_some() {
+            return Err(Error::InvalidState);
+        }
+        if buffer.is_empty() || buffer.len() > 0x3ffc / 4 {
             return Err(Error::InvalidBuffer);
         }
+
+        if !crate::soc::is_slice_in_dram(buffer)
+            || !crate::soc::is_slice_in_dram(core::slice::from_ref(descriptor))
+        {
+            return Err(Error::UnsupportedMemory);
+        }
+        let receive = Receive::new(descriptor, buffer)?;
+        let descriptor_address = receive.descriptor_address();
+        self.receive = Some(receive);
+        self.receive_error = None;
 
         let slc = SLC::regs();
         slc.slcconf0().modify(|_, w| {
@@ -350,8 +299,9 @@ impl<'d> SdioSlave<'d> {
             w.sdio_slc0_rx_no_restart_clr().set_bit();
             w.sdio_slc0_tx_loop_test().clear_bit()
         });
+        // esp-pacs 61f9678 addresses bit 1 here. TRM 34.19 specifies bit 0.
         slc.slc_rx_dscr_conf()
-            .modify(|_, w| w.sdio_slc0_token_no_replace().set_bit());
+            .modify(|r, w| unsafe { w.bits(receive::token_no_replace(r.bits())) });
         slc.slcconf1().modify(|_, w| {
             w.sdio_sdio_cmd_hold_en().clear_bit();
             w.sdio_slc0_len_auto_clr().clear_bit();
@@ -363,19 +313,8 @@ impl<'d> SdioSlave<'d> {
         slc.slcconf0()
             .modify(|_, w| w.sdio_slc0_tx_rst().clear_bit());
 
-        // Descriptor: owned by the DMA, empty, sized as the buffer, no next descriptor.
-        let buffer_address = buffer.as_mut_ptr() as u32;
-        unsafe {
-            ptr::write_volatile(
-                descriptor as *mut Descriptor,
-                Descriptor {
-                    dw0: (1 << 31) | (size as u32 & 0x3fff),
-                    buffer: buffer_address,
-                    next: 0,
-                },
-            );
-        }
-        let descriptor_address = descriptor as *mut Descriptor as u32;
+        // Orders descriptor stores before link activation on the C6 AHB bus.
+        dma_fence();
 
         slc.slc0int_clr()
             .write(|w| w.sdio_slc0_tx_suc_eof_int_clr().set_bit());
@@ -383,13 +322,11 @@ impl<'d> SdioSlave<'d> {
             .write(|w| unsafe { w.sdio_slc0_txlink_addr().bits(descriptor_address) });
         slc.slc0tx_link()
             .modify(|_, w| w.sdio_slc0_txlink_start().set_bit());
-        slc.slc0token1().write(|w| {
-            unsafe { w.sdio_slc0_token1_wdata().bits(1) };
-            w.sdio_slc0_token1_wr().set_bit()
-        });
+        // The counter is cumulative: overwriting it with 1 on explicit reuse
+        // would make the host's already-consumed credit disappear.
+        slc.slc0token1()
+            .write(|w| w.sdio_slc0_token1_inc().set_bit());
 
-        self.rx_desc = Some(descriptor);
-        self.rx_buffer = Some(buffer);
         self.state = next;
         Ok(())
     }
@@ -410,46 +347,103 @@ impl<'d> SdioSlave<'d> {
         Ok(())
     }
 
-    /// (A2a) Checks whether the host has finished writing a packet (`SLC0_TX_SUC_EOF` raw
-    /// interrupt). If so, clears that flag and returns the packet length in bytes, read from the
-    /// descriptor the DMA wrote back. The buffer is then readable with [`Self::received`]. The
-    /// receive DMA is **not** re-armed: one packet per [`Self::arm_receive`].
-    pub fn poll_received(&mut self) -> Option<usize> {
-        let slc = SLC::regs();
-        if !slc
-            .slc0int_raw()
-            .read()
-            .sdio_slc0_tx_suc_eof_int_raw()
-            .bit_is_set()
-        {
-            return None;
+    /// Checks for one successfully received packet.
+    ///
+    /// The EOF event and parked DMA are both required. The descriptor must have
+    /// CPU ownership, EOF, and a length within the buffer. A successful result
+    /// makes [`Self::received`] available and withdraws function readiness.
+    /// Subsequent polls return `Ok(None)`. No automatic rearming occurs.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::DmaError`] on a DMA overflow or descriptor error.
+    /// [`Error::InvalidDescriptor`] on invalid write-back. Storage remains owned
+    /// on error and must be stopped with [`Self::disable_bus`].
+    pub fn poll_received(&mut self) -> Result<Option<usize>, Error> {
+        if let Some(error) = self.receive_error {
+            return Err(error);
         }
+        if self.state != State::Function1Receiving {
+            return Ok(None);
+        }
+        let slc = SLC::regs();
+        let raw = slc.slc0int_raw().read();
+        if raw.sdio_slc0_tx_dscr_err_int_raw().bit_is_set()
+            || raw.sdio_slc0_tx_ovf_int_raw().bit_is_set()
+        {
+            return self.receive_failed(Error::DmaError);
+        }
+        if !raw.sdio_slc0_tx_suc_eof_int_raw().bit_is_set()
+            || !slc
+                .slc0tx_link()
+                .read()
+                .sdio_slc0_txlink_park()
+                .bit_is_set()
+        {
+            return Ok(None);
+        }
+        self.clear_function_ready();
+        dma_fence();
+        // SAFETY: successful EOF and parked DMA were observed above. The
+        // acquire barrier precedes every CPU access to the received bytes.
+        let result = unsafe { self.receive.as_mut().unwrap().finish() };
+        let length = match result {
+            Ok(length) => length,
+            Err(error) => return self.receive_failed(error),
+        };
         slc.slc0int_clr()
             .write(|w| w.sdio_slc0_tx_suc_eof_int_clr().set_bit());
-        let descriptor = self.rx_desc.as_ref()?;
-        let dw0 = unsafe { ptr::read_volatile(&descriptor.dw0) };
-        Some(((dw0 >> 14) & 0x3fff) as usize)
+        self.state = State::Function1Received;
+        Ok(Some(length))
     }
 
-    /// (A2a) The first `length` bytes of the receive buffer (clamped to its size).
-    pub fn received(&self, length: usize) -> &[u8] {
-        match self.rx_buffer.as_ref() {
-            Some(buffer) => {
-                let bytes = buffer.len() * 4;
-                let length = length.min(bytes);
-                unsafe { core::slice::from_raw_parts(buffer.as_ptr() as *const u8, length) }
-            }
-            None => &[],
+    /// Returns the validated packet after successful completion.
+    ///
+    /// Returns `None` before completion and after an error or bus disable.
+    /// The length comes from validated DMA write-back, not from the caller.
+    pub fn received(&self) -> Option<&[u8]> {
+        if self.state != State::Function1Received {
+            return None;
         }
+        self.receive.as_ref()?.received()
+    }
+
+    /// Returns descriptor and buffer storage after disabling the bus.
+    ///
+    /// This operation permits explicit reuse of the static allocations. It does
+    /// not arm DMA, expose pads, or publish a new token.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidState`] unless [`Self::disable_bus`] has succeeded.
+    pub fn take_receive_buffers(
+        &mut self,
+    ) -> Result<Option<(&'static mut Descriptor, &'static mut [u32])>, Error> {
+        if self.state != State::ControllerReady {
+            return Err(Error::InvalidState);
+        }
+        // SAFETY: ControllerReady can only be reached after DMA is confirmed
+        // stopped, or before any transfer. take() prevents double restitution.
+        Ok(self
+            .receive
+            .take()
+            .map(|receive| unsafe { receive.into_buffers() }))
+    }
+
+    fn receive_failed(&mut self, error: Error) -> Result<Option<usize>, Error> {
+        self.clear_function_ready();
+        self.receive_error = Some(error);
+        self.state = State::Function1ReceiveError;
+        Err(error)
     }
 
     /// (A2a) Raw receive-path registers, read without clearing anything.
     pub fn receive_diagnostics(&self) -> ReceiveDiagnostics {
         let slc = SLC::regs();
         let descriptor_dw0 = self
-            .rx_desc
+            .receive
             .as_ref()
-            .map(|d| unsafe { ptr::read_volatile(&d.dw0) })
+            .map(Receive::descriptor_word)
             .unwrap_or(0);
         ReceiveDiagnostics {
             descriptor_dw0,
@@ -463,20 +457,44 @@ impl<'d> SdioSlave<'d> {
         }
     }
 
-    /// Stops the SLC0 receive DMA and resets its FSM, if it was armed. The descriptor and the
-    /// buffer are released to the caller's static storage only after the DMA is stopped.
-    fn stop_receive_dma(&mut self) {
-        if self.state != State::Function1Receiving {
-            return;
+    /// Confirms idle before allowing resource reuse. A timeout holds TX reset
+    /// asserted and preserves storage, pads, and clock ownership.
+    fn stop_receive_dma(&mut self) -> Result<(), Error> {
+        if self.receive.is_none() {
+            return Ok(());
         }
         let slc = SLC::regs();
         slc.slc0tx_link()
             .modify(|_, w| w.sdio_slc0_txlink_stop().set_bit());
+        dma_fence();
+        let parked = || {
+            let link = slc.slc0tx_link().read();
+            link.sdio_slc0_txlink_park().bit_is_set()
+                && link.sdio_slc0_txlink_start().bit_is_clear()
+                && link.sdio_slc0_txlink_stop().bit_is_clear()
+        };
+        let mut idle = wait_for_idle(parked);
         slc.slcconf0().modify(|_, w| w.sdio_slc0_tx_rst().set_bit());
+        dma_fence();
+        if !idle {
+            idle = wait_for_idle(parked);
+        }
+        if !idle {
+            self.receive_error = Some(Error::DmaStopTimeout);
+            self.state = State::Function1ReceiveError;
+            return Err(Error::DmaStopTimeout);
+        }
+        dma_fence();
         slc.slcconf0()
             .modify(|_, w| w.sdio_slc0_tx_rst().clear_bit());
-        self.rx_desc = None;
-        self.rx_buffer = None;
+        slc.slc0int_clr().write(|w| {
+            w.sdio_slc0_tx_suc_eof_int_clr().set_bit();
+            w.sdio_slc0_tx_dscr_err_int_clr().set_bit();
+            w.sdio_slc0_tx_ovf_int_clr().set_bit()
+        });
+        dma_fence();
+        self.receive_error = None;
+        Ok(())
     }
 
     fn clear_function_ready(&self) {
@@ -496,9 +514,27 @@ impl<'d> SdioSlave<'d> {
 impl Drop for SdioSlave<'_> {
     fn drop(&mut self) {
         if self.state.pads_routed() {
-            self.stop_receive_dma();
             self.clear_function_ready();
+            if self.stop_receive_dma().is_err() {
+                // Reset stays asserted. Leaking one clock reference and static
+                // storage is safer than permitting DMA to access reused memory.
+                if let Some(clock) = self._clock.take() {
+                    core::mem::forget(clock);
+                }
+                return;
+            }
             self.release_pads();
         }
     }
+}
+
+/// Orders CPU memory and peripheral I/O accesses at DMA ownership boundaries.
+fn dma_fence() {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: this instruction only orders accesses; it touches no registers or
+    // stack memory. No `nomem` option: the compiler must also respect the barrier.
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+    }
+    compiler_fence(Ordering::SeqCst);
 }

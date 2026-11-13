@@ -1,6 +1,11 @@
 # ESP32-C6 SDIO Slave — Native Rust bring-up
 
-Status: **foundation only; not an operational SDIO Slave driver**.
+Status: **A1 enumeration and a first A2a receive path are implemented.**
+A1 enumeration and a 64-byte A2a transfer were reported by the developer for
+`785357be3d2ab323e57f357dcc4d1e106b33b36d`. Corrections after that revision
+are not hardware-qualified. The current DMA lifecycle and safety contract are
+in [A2a](esp32c6-sdio-a2a.md); the A1-only contract below is historical and
+applies to usage without `arm_receive`.
 
 ## Goals
 
@@ -10,7 +15,7 @@ The implementation must not use ESP-IDF, C FFI, or copied ESP-IDF driver logic.
 The SDIO transport is hardware-specific; RPC, Zenoh, remote TCP, provisioning,
 and network services are **not** part of this driver.
 
-## A1 contract — controller bring-up (implemented, not hardware-qualified)
+## A1-only contract — controller bring-up
 
 Sources: ESP32-C6 TRM v1.2 chapter 34 (SDIO Slave Controller), chapter 7 (IO MUX
 and GPIO matrix) and chapter 8 (PCR); `esp-pacs` rev `61f9678` (field
@@ -115,7 +120,7 @@ and drain its engine before both operations.
 ### Invariants
 
 1. `new` does not route pads and does not write `HINF`/`SLC`/`SLCHOST`.
-2. No code path sets `IOREADY1/2`, writes `*_LINK`, `*_LINK_ADDR` or
+2. In A1-only usage, no code path sets `IOREADY1/2`, writes `*_LINK`, `*_LINK_ADDR` or
    `*SHAREMEM*`, or touches an interrupt enable.
 3. `snapshot()` is always valid: the clock guard lives as long as the value.
    Diagnostics never clear or acknowledge anything. The snapshot also reads
@@ -189,9 +194,9 @@ The firmwares and the operator recipe for this qualification are described in
 5. `disable_bus` and `Drop`: pads on plain GPIO with input and output disabled (pulls unchanged), `IOREADY1/2` still 0,
    repeated `enable_bus`/`disable_bus` cycles.
 
-## Required A2–A4 work
+## Remaining A2–A4 work
 
-- A2: DMA descriptors, accessible/aligned memory, buffer ownership, queue
+- A2: A2a covers one host-to-slave packet; A2b slave-to-host DMA, queue
   lifetime and cancellation, with zero C dependencies.
 - A3: SLC0/SLC1 interrupt dispatch, wake-up of async tasks, DAT1 notification,
   full/empty and error handling.
