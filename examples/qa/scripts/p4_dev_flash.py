@@ -4,7 +4,7 @@
 Not a qualification recipe: no reference comparison of neighbouring sectors. Safety kept: manifest envelope
 0x110000-0x128000, ONE write, no retry, no restoration, local grant armed by the operator, stop at the first error.
 
-Usage: python p4_dev_flash.py <app.bin> <sha256>      (board in ROM download mode, native USB, 'Entree manuelle' checked)
+Usage: python p4_dev_flash.py <app.bin> <sha256> [manifest.json]     (board in ROM download mode, native USB, 'Entree manuelle' checked)
 """
 import hashlib, json, sys, time
 from pathlib import Path
@@ -27,7 +27,7 @@ def main():
     path, want = Path(sys.argv[1]), sys.argv[2]
     app = path.read_bytes()
     assert hashlib.sha256(app).hexdigest() == want, 'image does not match the given SHA-256'
-    manifest = CampaignManifest(json.loads((EVID / 'manifest.json').read_text()))
+    manifest = CampaignManifest(json.loads((EVID / (sys.argv[3] if len(sys.argv) > 3 else 'manifest.json')).read_text()))
     manifest.check_region(DEVICE, ADDR, len(app))
     config = json.loads((ROOT / 'tokens.json').read_text())
     keys = [k for k, w in config.items() if w.get('id') == 'claude' and w.get('role') == 'client']
