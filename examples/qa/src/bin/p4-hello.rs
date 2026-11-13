@@ -7,7 +7,8 @@
 //! Stages (each line starts with `P4-HELLO`):
 //! - `STAGE0` is printed on UART0 **before** `esp_hal::init`, through `esp-println` (raw UART0
 //!   FIFO, baud as left by the ROM).
-//! - `STAGE1` after `esp_hal::init`, on UART0 and on USB-Serial-JTAG.
+//! - `STAGE1` after `esp_hal::init`, on UART0 (ROM function, tag `[rom]`), on UART0 through the
+//!   esp-hal driver (clock, GPIO37 TX, 115200 baud, tag `[hal]`) and on USB-Serial-JTAG.
 //! - `ALIVE n` every second on both. The USB-Serial-JTAG writes are non-blocking and bounded:
 //!   without a host reading that port they are skipped, so the UART0 output never stops because of
 //!   them.
@@ -28,7 +29,13 @@
 use core::fmt::Write as _;
 
 use esp_backtrace as _;
-use esp_hal::{delay::Delay, main, time::Instant, usb::usb_serial_jtag::UsbSerialJtag};
+use esp_hal::{
+    delay::Delay,
+    main,
+    time::Instant,
+    uart::{Config as UartConfig, Uart},
+    usb::usb_serial_jtag::UsbSerialJtag,
+};
 use esp_println::println;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -68,16 +75,30 @@ fn usb_try(usb: &mut UsbSerialJtag<'_, esp_hal::Blocking>, bytes: &[u8]) {
     let _ = usb.flush_tx_nb();
 }
 
+/// Writes through the esp-hal UART0 driver when it could be created.
+fn hal_write(uart: &mut Option<Uart<'_, esp_hal::Blocking>>, bytes: &[u8]) {
+    if let Some(uart) = uart {
+        let _ = uart.write(bytes);
+    }
+}
+
 #[main]
 fn main() -> ! {
     println!(
-        "P4-HELLO STAGE0 pre-init sha={} fw=p4-hello console=uart0-raw",
+        "P4-HELLO STAGE0 [rom] pre-init sha={} fw=p4-hello-v2",
         GIT_SHA
     );
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
     let delay = Delay::new();
     let mut usb = UsbSerialJtag::new(peripherals.USB_DEVICE);
+    // UART0 through the esp-hal driver, independent of the ROM output function.
+    let mut uart = Uart::new(
+        peripherals.UART0,
+        UartConfig::default().with_baudrate(115_200),
+    )
+    .ok()
+    .map(|uart| uart.with_tx(peripherals.GPIO37));
 
     let revision = esp_hal::efuse::chip_revision();
     let mut line = Line {
@@ -90,12 +111,13 @@ fn main() -> ! {
         GIT_SHA, revision.major, revision.minor
     );
     println!(
-        "{}",
+        "[rom] {}",
         core::str::from_utf8(&line.bytes[..line.len])
             .unwrap_or("?")
             .trim_end()
     );
     usb_try(&mut usb, &line.bytes[..line.len]);
+    hal_write(&mut uart, b"P4-HELLO STAGE1 [hal] esp-hal UART0 driver\r\n");
 
     let mut n: u32 = 0;
     loop {
@@ -108,11 +130,13 @@ fn main() -> ! {
         };
         let _ = write!(line, "P4-HELLO ALIVE n={} uptime_ms={}\r\n", n, ms);
         println!(
-            "{}",
+            "[rom] {}",
             core::str::from_utf8(&line.bytes[..line.len])
                 .unwrap_or("?")
                 .trim_end()
         );
         usb_try(&mut usb, &line.bytes[..line.len]);
+        hal_write(&mut uart, b"[hal] ");
+        hal_write(&mut uart, &line.bytes[..line.len]);
     }
 }
