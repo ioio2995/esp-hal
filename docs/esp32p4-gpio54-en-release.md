@@ -57,17 +57,27 @@ cd examples/qa && cargo clippy --release --target riscv32imafc-unknown-none-elf 
 Target `riscv32imafc-unknown-none-elf`; ELF in `target/riscv32imafc-unknown-none-elf/release/p4-gpio54-en-release`. Built from commit `c55d10b0a` (the firmware commit): ELF sha256 `e406273d14ac0023583d7ddd01948405fa1f495f312ef5c3c2b6b49c92c0ed4d`.
 
 ## Image for a later programming (offline, nothing flashed)
-```sh
-espflash save-image --chip esp32p4 --merge --skip-padding --flash-size 32mb <elf> p4-gpio54-en-merged.bin
-```
-Result: 124,880 bytes, sha256 `927a62c56ebf092c6dea3f296aa250018e59f7e416578ae140bbd0b47c87b382`. Layout: bootloader at 0x2000 (image header 0xE9), partition table at 0x8000, application at 0x10000; bytes 0 to 0x1FFF are padding. Sector span to approve: **0x0 to 0x1F000**.
+**Correction (flash contents).** An earlier version of this section assumed that the P4 held no valid partition table and
+proposed a merged image written over `0x0` to `0x1F000`. That was wrong. A read-only reference backup of the board shows a
+valid factory partition table at 0x8000 (`nvsfactory` 0x9000/200K, `nvs` 0x3b000/840K, `otadata` 0x10d000, `phy_init`
+0x10f000, `factory` 0x110000/9M, `storage` 0xa10000/5M) and an ESP-IDF bootloader at 0x2000. A merged image or an image
+at 0x10000 would replace the table and overwrite `nvsfactory`/`nvs`. **Do not use `--merge`, and do not write at 0x0 or
+0x10000.**
 
-**Warning.** Without `--skip-padding`, `--merge --flash-size 32mb` produces a **33,554,432-byte image padded to the whole flash**: programming it at address 0 would overwrite the entire P4 flash. Never use that form. This image also places a bootloader, a partition table and an application over whatever the P4 holds now (the bench read a bootloader header at 0x2000 and found no valid table at 0x8000): **a verified backup and the restoration contract come first.**
+Correct approach: build an application-only image for the `factory` partition and write it at **0x110000**, keeping the
+factory bootloader and table. The procedure, the table and the compatibility analysis are in
+`docs/esp32p4-waveshare-flash-layout.md` of the SDIO slave branch (`feat/esp32c6-sdio-slave`):
+```sh
+espflash save-image --chip esp32p4 --flash-mode dio --flash-size 32mb --flash-freq 80mhz \
+  --partition-table <waveshare-p4-factory.csv> --target-app-partition factory -S <elf> p4-gpio54-en-app.bin
+```
+The earlier merged image (`927a62c5...`, region 0x0 to 0x1F000) is superseded and must not be programmed. A verified backup
+and the restoration contract still come first.
 
 ## Programming and measurement procedure (NOT authorised, NOT executed)
 All hardware actions go through IOBEWI Device Lab, with explicit operator consent for each scenario.
 1. Preconditions: the P4 read problem is understood and its workaround verified (`rust_dev` `bench/docs/p4-flash-read-diagnostic.md`); full P4 backup verified (`p4-full-backup.md`); persistent evidence root; restoration contract accepted.
-2. Operator-approved write region 0x0 to 0x1F000, the image file pinned by its SHA-256, grant, destructive consent per command.
+2. Operator-approved write region 0x110000 (whole 4 KiB sectors covering the application-only image), the image file pinned by its SHA-256, grant, destructive consent per command.
 3. Programming and independent readback through the `PC-CYCLE` mechanism, with restoration available.
 4. Observe the P4 console for the lines above.
 5. Electrical check by the operator, outside the bench: with a meter or scope on the C6 EN pin (or the R54/R13 node), expect a steady high level (about 3.3 V) and no low pulse while the firmware runs. Record the capture. Without this measurement the electrical level is **not** established, whatever the console says.
