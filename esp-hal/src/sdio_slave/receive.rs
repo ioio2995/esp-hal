@@ -38,6 +38,75 @@ impl Default for Descriptor {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for Descriptor {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(
+            f,
+            "Descriptor {{ buffer: {=u32:#x}, next: {=u32:#x} }}",
+            self.buffer,
+            self.next
+        );
+    }
+}
+
+/// A refused receive arm, including the original descriptor and buffer.
+///
+/// Recover storage with [`Self::into_parts`] before retrying. Debug and Display
+/// expose only the error code, never the buffer contents.
+pub struct ArmReceiveError {
+    error: Error,
+    descriptor: &'static mut Descriptor,
+    buffer: &'static mut [u32],
+}
+
+impl ArmReceiveError {
+    pub(super) fn new(
+        error: Error,
+        descriptor: &'static mut Descriptor,
+        buffer: &'static mut [u32],
+    ) -> Self {
+        Self {
+            error,
+            descriptor,
+            buffer,
+        }
+    }
+
+    /// Returns the reason why arming was refused.
+    pub fn error(&self) -> Error {
+        self.error
+    }
+
+    /// Returns the reason and the unchanged, exclusively owned storage.
+    pub fn into_parts(self) -> (Error, &'static mut Descriptor, &'static mut [u32]) {
+        (self.error, self.descriptor, self.buffer)
+    }
+}
+
+impl core::fmt::Debug for ArmReceiveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ArmReceiveError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Display for ArmReceiveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl core::error::Error for ArmReceiveError {}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for ArmReceiveError {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(f, "ArmReceiveError {{ error: {:?} }}", self.error);
+    }
+}
+
 /// Owns the static borrows without retaining references to DMA-owned memory.
 pub(super) struct Receive {
     descriptor: NonNull<Descriptor>,
@@ -51,9 +120,13 @@ impl Receive {
     pub(super) fn new(
         descriptor: &'static mut Descriptor,
         buffer: &'static mut [u32],
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ArmReceiveError> {
         if buffer.is_empty() || buffer.len() > 0x3ffc / 4 {
-            return Err(Error::InvalidBuffer);
+            return Err(ArmReceiveError::new(
+                Error::InvalidBuffer,
+                descriptor,
+                buffer,
+            ));
         }
         let capacity = buffer.len() * 4;
         let buffer = NonNull::new(buffer.as_mut_ptr()).unwrap();
@@ -220,13 +293,22 @@ mod tests {
     }
 
     #[test]
-    fn invalid_buffer_sizes_are_refused_before_publication() {
+    fn invalid_buffer_sizes_return_original_storage_unchanged() {
         for words in [0, 4096] {
-            let descriptor = Box::into_raw(Box::new(Descriptor::new()));
-            let buffer = Box::into_raw(vec![0; words].into_boxed_slice());
-            let result = unsafe { Receive::new(&mut *descriptor, &mut *buffer) };
-            assert!(matches!(result, Err(Error::InvalidBuffer)));
+            let descriptor = Box::leak(Box::new(Descriptor::new()));
+            let descriptor_pointer = descriptor as *mut Descriptor;
+            let buffer = vec![0x11223344; words].leak();
+            let buffer_pointer = buffer.as_mut_ptr();
+            let error = Receive::new(descriptor, buffer).err().unwrap();
+            assert_eq!(error.error(), Error::InvalidBuffer);
+            assert!(!format!("{error:?}").contains("11223344"));
+            let (code, descriptor, buffer) = error.into_parts();
+            assert_eq!(code, Error::InvalidBuffer);
+            assert_eq!(descriptor as *mut Descriptor, descriptor_pointer);
+            assert_eq!(buffer.as_mut_ptr(), buffer_pointer);
+            assert!(buffer.iter().all(|word| *word == 0x11223344));
             unsafe {
+                assert_eq!(*descriptor.dw0.get(), 0);
                 drop(Box::from_raw(descriptor));
                 drop(Box::from_raw(buffer));
             }

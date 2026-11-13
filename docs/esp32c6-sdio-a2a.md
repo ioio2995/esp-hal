@@ -8,7 +8,8 @@ is included.
 ## Ownership and completion
 
 `arm_receive` consumes one `&'static mut Descriptor` and one `&'static mut [u32]`.
-Both complete allocations must be in internal DRAM. The buffer is non-empty,
+On refusal, `ArmReceiveError::into_parts()` returns the error code and both
+original allocations unchanged. Both complete allocations must be in internal DRAM. The buffer is non-empty,
 word-aligned, and at most 16380 bytes. Static storage alone does not establish
 DMA accessibility.
 
@@ -90,3 +91,36 @@ See [the P4 flash layout](esp32p4-waveshare-flash-layout.md). Only the P4
 application image belongs at 0x110000 under that documented factory layout.
 Programming is a separate operator-authorized action and is not part of the
 software validation of these changes.
+
+## Upstream preparation
+
+The SDIO changes, local QA, and generic xtask correction have separate review
+concerns. Before an upstream submission, extract the xtask regression fix and
+the PAC metadata patch as independent proposals. Keep board-specific Device Lab
+recipes and factory flash assumptions out of the portable driver contract.
+
+The C6-specific PAC patch is included as [esp-pacs-c6-slc.patch](esp-pacs-c6-slc.patch). It corrects
+TOKEN_NO_REPLACE (bit 0), both TOKEN1_WDATA fields (12 bits), SLC1 token field
+names, and read-only PARK fields. Other chips sharing `common_patches/slc.yaml`
+are unchanged. Source references: C6 TRM v1.2 registers 34.8/34.10/34.12/34.14,
+34.16/34.17/34.19; Espressif v5.4.2 `components/soc/esp32c6/register/soc/slc_reg.h`.
+
+Software acceptance does not establish STOP/PARK timing, pad electrical levels,
+EN measurements, or behaviour under a physical reset. Those limits stay explicit;
+the earlier 64-byte result does not qualify the corrected revision.
+
+## Software validation commands
+
+- `cargo xtask host-tests esp-hal-host-tests`: native host tests and Miri.
+- `cargo test -p esp-devtool --lib host_test_command_tests`: Miri command construction regressions.
+- `cargo xtask check esp-hal esp32c6`: C6 configuration matrix, including the added defmt case.
+- `cargo xtask lint esp-hal esp32c6`: Clippy with warnings denied.
+- `cargo xtask documentation --packages=esp-hal esp32c6`: rustdoc.
+- `cargo xtask build qa esp32c6 sdio-a2-c6-slave`: C6 QA compilation.
+- `SDIO_A2=1 cargo xtask build qa esp32p4 sdio-a1-p4-host`: P4 A2a QA compilation.
+
+The separate PAC patch was generated and built with `cargo xtask build esp32c6`
+in esp-pacs. Its three host regressions run with an explicit host target:
+`cargo +stable test --manifest-path esp32c6/Cargo.toml --target x86_64-unknown-linux-gnu --test slc_fields`.
+They exercise generated accessor bit packing against RAM-backed registers, not
+real peripherals. The four PARK fields are also verified read-only in the patched SVD.

@@ -56,15 +56,14 @@ pub enum FunctionState {
 pub enum Error {
     /// The operation is not allowed in the current [`State`].
     InvalidState,
-    /// A DMA buffer is empty, not word-sized, or larger than one descriptor can
-    /// describe (the size field is 14 bits wide).
+    /// A DMA buffer is empty or larger than 16380 bytes.
     InvalidBuffer,
     /// A descriptor or buffer is outside internal DMA-accessible RAM.
     UnsupportedMemory,
     /// DMA write-back has an invalid owner, EOF, size, or length.
     InvalidDescriptor,
     /// The receive DMA reported an overflow or a descriptor error.
-    DmaError,
+    DmaFault,
     /// The receive DMA did not become idle within the polling bound.
     DmaStopTimeout,
 }
@@ -121,3 +120,18 @@ pub(super) fn wait_for_idle(mut parked: impl FnMut() -> bool) -> bool {
     }
     false
 }
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidState => "operation is not allowed in this state",
+            Self::InvalidBuffer => "receive buffer must contain 1..=4095 words",
+            Self::UnsupportedMemory => "DMA storage must be in internal DRAM",
+            Self::InvalidDescriptor => "invalid DMA descriptor write-back",
+            Self::DmaFault => "DMA overflow or descriptor fault",
+            Self::DmaStopTimeout => "DMA stop did not reach idle within the polling bound",
+        })
+    }
+}
+
+impl core::error::Error for Error {}

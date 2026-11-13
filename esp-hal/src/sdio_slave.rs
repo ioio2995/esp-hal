@@ -32,8 +32,8 @@ use crate::{
 mod receive;
 mod state;
 
-pub use receive::Descriptor;
 use receive::Receive;
+pub use receive::{ArmReceiveError, Descriptor};
 use state::wait_for_idle;
 pub use state::{Error, FunctionState, State};
 
@@ -263,6 +263,7 @@ impl<'d> SdioSlave<'d> {
     ///
     /// # Errors
     ///
+    /// [`ArmReceiveError`] retains the original storage and contains
     /// [`Error::InvalidState`] unless the state is [`State::BusExposed`]; [`Error::InvalidBuffer`]
     /// if the buffer is empty or larger than 16380 bytes. [`Error::UnsupportedMemory`]
     /// if either allocation is outside internal RAM. Existing storage must be
@@ -271,22 +272,38 @@ impl<'d> SdioSlave<'d> {
         &mut self,
         descriptor: &'static mut Descriptor,
         buffer: &'static mut [u32],
-    ) -> Result<(), Error> {
+    ) -> Result<(), ArmReceiveError> {
         let next = State::Function1Receiving;
         if !self.state.can_transition_to(next) || self.state != State::BusExposed {
-            return Err(Error::InvalidState);
+            return Err(ArmReceiveError::new(
+                Error::InvalidState,
+                descriptor,
+                buffer,
+            ));
         }
         if self.receive.is_some() {
-            return Err(Error::InvalidState);
+            return Err(ArmReceiveError::new(
+                Error::InvalidState,
+                descriptor,
+                buffer,
+            ));
         }
         if buffer.is_empty() || buffer.len() > 0x3ffc / 4 {
-            return Err(Error::InvalidBuffer);
+            return Err(ArmReceiveError::new(
+                Error::InvalidBuffer,
+                descriptor,
+                buffer,
+            ));
         }
 
         if !crate::soc::is_slice_in_dram(buffer)
             || !crate::soc::is_slice_in_dram(core::slice::from_ref(descriptor))
         {
-            return Err(Error::UnsupportedMemory);
+            return Err(ArmReceiveError::new(
+                Error::UnsupportedMemory,
+                descriptor,
+                buffer,
+            ));
         }
         let receive = Receive::new(descriptor, buffer)?;
         let descriptor_address = receive.descriptor_address();
@@ -356,7 +373,7 @@ impl<'d> SdioSlave<'d> {
     ///
     /// # Errors
     ///
-    /// [`Error::DmaError`] on a DMA overflow or descriptor error.
+    /// [`Error::DmaFault`] on a DMA overflow or descriptor error.
     /// [`Error::InvalidDescriptor`] on invalid write-back. Storage remains owned
     /// on error and must be stopped with [`Self::disable_bus`].
     pub fn poll_received(&mut self) -> Result<Option<usize>, Error> {
@@ -371,7 +388,7 @@ impl<'d> SdioSlave<'d> {
         if raw.sdio_slc0_tx_dscr_err_int_raw().bit_is_set()
             || raw.sdio_slc0_tx_ovf_int_raw().bit_is_set()
         {
-            return self.receive_failed(Error::DmaError);
+            return self.receive_failed(Error::DmaFault);
         }
         if !raw.sdio_slc0_tx_suc_eof_int_raw().bit_is_set()
             || !slc
@@ -537,4 +554,25 @@ fn dma_fence() {
         core::arch::asm!("fence iorw, iorw", options(nostack));
     }
     compiler_fence(Ordering::SeqCst);
+}
+
+impl core::fmt::Debug for SdioSlave<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SdioSlave")
+            .field("state", &self.state)
+            .field("receive_error", &self.receive_error)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for SdioSlave<'_> {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(
+            f,
+            "SdioSlave {{ state: {:?}, receive_error: {:?} }}",
+            self.state,
+            self.receive_error
+        );
+    }
 }
