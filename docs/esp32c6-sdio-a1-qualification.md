@@ -1,7 +1,10 @@
 # ESP32-C6 SDIO Slave A1 — hardware qualification recipe (P4 host ↔ C6 slave)
 
-Status: **prepared, not executed.** No firmware described here has been flashed or run. No result
-in this file is an observation.
+Status: **A1 recipe, retained separately from reported execution results.**
+The developer reported A1 enumeration and an A2a packet for source `785357be`.
+This document does not contain those raw logs or qualify later changes.
+The recipe below uses `SDIO_A2=0`; for `SDIO_A2=1`, see
+[the A2a contract](esp32c6-sdio-a2a.md).
 
 Scope: qualify the A1 bring-up of `esp_hal::sdio_slave` (clock, pads, `IOREADY1/2` kept at 0) by
 enumerating the ESP32-C6 from the ESP32-P4 SDMMC host on a Waveshare ESP32-P4-WIFI6-POE-ETH board.
@@ -17,7 +20,7 @@ Related: `docs/esp32c6-sdio-slave-bringup.md` (driver contract, TRM findings, op
 | `sdio-a1-p4-host` | `examples/qa/src/bin/sdio-a1-p4-host.rs` | ESP32-P4 | Drives C6 EN (GPIO54), then CMD0, CMD5, CMD3, CMD7 and CMD52 **reads** of CCCR, FBR and CIS, at 400 kHz, 1-bit, SDMMC slot 1. |
 | shared logic | `examples/qa/src/sdio_a1.rs` | both | Decoders (R4, R6, CCCR, FBR), bounded CIS walk, tally. Compiled by the host tests too. |
 
-The P4 firmware never writes a CCCR register, never changes bus width or clock, never negotiates
+With `SDIO_A2=0`, the P4 firmware never writes a CCCR register, never changes bus width or clock, never negotiates
 high speed or UHS, never enables a function and never issues CMD53. Neither firmware prints a
 global verdict: it is established from both console logs (section 7).
 
@@ -191,7 +194,7 @@ keeps A1 open. A software pass (compilation, host tests) is never a substitute.
 
 ## 8. Known limits of this preparation
 
-- No hardware observation exists. Every `PASS` condition above is expected behaviour, not a result.
+- The conditions above define the recipe; reported hardware observations require their own revision-pinned evidence.
 - The SD/SDIO specifications were not available: R4/R6/R5 field layouts and the R1 form for CMD7
   come from the `sdio` crate and from the specification as remembered, and are marked **[SPEC]** in
   `examples/qa/src/sdio_a1.rs`.

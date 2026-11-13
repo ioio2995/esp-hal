@@ -26,6 +26,7 @@ use esp_hal::{
     uart::{Config as UartConfig, Uart},
 };
 use esp_println::println;
+use qa_test::sdio_a1::a2a_packet_matches;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -158,18 +159,30 @@ fn main() -> ! {
         }
 
         if !received {
-            if let Some(length) = slave.poll_received() {
-                received = true;
-                let d = slave.receive_diagnostics();
-                a2!(
-                    "RX_PACKET",
-                    "PASS",
-                    "length={} descriptor_dw0={:#010x} int_raw={:#010x} data={}",
-                    length,
-                    d.descriptor_dw0,
-                    d.interrupt_raw,
-                    Hex(slave.received(length))
-                );
+            match slave.poll_received() {
+                Ok(Some(length)) => {
+                    received = true;
+                    let d = slave.receive_diagnostics();
+                    let bytes = slave.received().unwrap_or(&[]);
+                    a2!(
+                        "RX_PACKET",
+                        if a2a_packet_matches(bytes) {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        },
+                        "length={} descriptor_dw0={:#010x} int_raw={:#010x} data={}",
+                        length,
+                        d.descriptor_dw0,
+                        d.interrupt_raw,
+                        Hex(bytes)
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    received = true;
+                    a2!("RX_PACKET", "FAIL", "error={:?}; no retry", error);
+                }
             }
         }
 

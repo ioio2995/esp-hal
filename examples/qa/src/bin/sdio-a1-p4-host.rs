@@ -11,9 +11,10 @@
 //! | H4   | CMD52 reads of CCCR `0x00..=0x16`, `IOEx`, `IORx` |
 //! | H5   | CMD52 reads of the FBR and bounded walks of the CIS of functions 0, 1 and 2 |
 //!
-//! Only CMD52 *reads* are issued. The firmware never writes a CCCR register, never changes the bus
-//! width or the clock, never negotiates high speed or UHS, never enables a function and issues no
-//! CMD53. It does not modify the host driver.
+//! With `SDIO_A2=0` (default), only CMD52 *reads* are issued. The firmware never writes a CCCR
+//! register, never changes the bus width or the clock, never negotiates high speed or UHS, never
+//! enables a function and issues no CMD53. With `SDIO_A2=1`, it enables function 1 and writes one
+//! 64-byte packet. It does not modify the host driver.
 //!
 //! The firmware reports host-side results only. It never prints a global qualification verdict:
 //! that needs the C6 console log (`sdio-a1-c6-slave`) as well. A line says `PASS` only for a step
@@ -38,8 +39,8 @@
 //! Build-time parameters (environment variables, all optional, decimal):
 //!
 //! - `SDIO_A1_GIT_SHA`, `SDIO_A1_RUN_ID`: printed in the log lines.
-//! - `SDIO_A1_RESET_HOLD_MS` (default 100): time EN is held low. Conservative: no datasheet
-//!   minimum was consulted.
+//! - `SDIO_A1_RESET_HOLD_MS` (default 100): time EN is held low. Conservative: no datasheet minimum
+//!   was consulted.
 //! - `SDIO_A1_BOOT_WAIT_MS` (default 2000): wait after releasing EN. A timer, not proof of boot.
 //! - `SDIO_A1_CMD5_TRIES` (default 10) and `SDIO_A1_CMD5_RETRY_MS` (default 200): attempts of the
 //!   first CMD5.
@@ -87,8 +88,10 @@ use qa_test::sdio_a1::{
     R4Class,
     R4Info,
     R6Info,
+    cmd53_arg,
     fbr_base,
     parse_u32,
+    wait_function1_ready,
     walk_cis,
 };
 use sdio::{Command, Response, ResponseLen};
@@ -108,8 +111,8 @@ const BOOT_WAIT_MS: u32 = parse_u32(option_env!("SDIO_A1_BOOT_WAIT_MS"), 2000);
 const CMD5_TRIES: u32 = parse_u32(option_env!("SDIO_A1_CMD5_TRIES"), 10);
 const CMD5_RETRY_MS: u32 = parse_u32(option_env!("SDIO_A1_CMD5_RETRY_MS"), 200);
 const ROUNDS: u32 = parse_u32(option_env!("SDIO_A1_ROUNDS"), 1);
-/// Build-time switch `SDIO_A2=1`: after the A1 enumeration, enable function 1 and write one packet with CMD53 (A2a).
-/// With it, this firmware is no longer "writes=none".
+/// Build-time switch `SDIO_A2=1`: after the A1 enumeration, enable function 1 and write one packet
+/// with CMD53 (A2a). With it, this firmware is no longer "writes=none".
 const A2: u32 = parse_u32(option_env!("SDIO_A2"), 0);
 const ROUND_GAP_MS: u32 = parse_u32(option_env!("SDIO_A1_ROUND_GAP_MS"), 500);
 const CLOCK_HZ: u32 = parse_u32(option_env!("SDIO_A1_CLOCK_HZ"), 400_000);
@@ -226,7 +229,12 @@ fn cmd52_read(slot: &mut HostSlot<'_>, function: u8, addr: u32) -> Result<u8, Re
 }
 
 /// Writes one byte of function `function` with CMD52 and returns the R5 data byte (A2 only).
-fn cmd52_write(slot: &mut HostSlot<'_>, function: u8, addr: u32, data: u8) -> Result<u8, ReadError> {
+fn cmd52_write(
+    slot: &mut HostSlot<'_>,
+    function: u8,
+    addr: u32,
+    data: u8,
+) -> Result<u8, ReadError> {
     let cmd = sdio::sdio::Cmd52 {
         write: true,
         function,
@@ -239,16 +247,6 @@ fn cmd52_write(slot: &mut HostSlot<'_>, function: u8, addr: u32, data: u8) -> Re
         return Err(ReadError::R5Flags(r5.flags));
     }
     Ok(r5.data)
-}
-
-/// CMD53 argument: R/W, function, block mode, op code (1 = incrementing address), register address, count.
-fn cmd53_arg(write: bool, function: u8, block: bool, incrementing: bool, addr: u32, count: u32) -> u32 {
-    (write as u32) << 31
-        | ((function as u32) & 7) << 28
-        | (block as u32) << 27
-        | (incrementing as u32) << 26
-        | (addr & 0x1_ffff) << 9
-        | (count & 0x1ff)
 }
 
 /// 64-byte aligned, 64-byte long DMA buffer (the P4 data cache line is 64 bytes).
@@ -264,33 +262,70 @@ fn read_fn1_u32(slot: &mut HostSlot<'_>, addr: u32) -> Result<u32, ReadError> {
     Ok(value)
 }
 
-/// A2a: enable function 1, wait for IOR1, read the receive token, send one 64-byte packet with CMD53.
+/// A2a: enable function 1, wait for IOR1, read the receive token, send one 64-byte packet with
+/// CMD53.
 ///
-/// The packet goes to the incrementing-address window: start address `0x1F800 - length` (TRM 34.5.5.3), byte mode.
+/// The packet goes to the incrementing-address window: start address `0x1F800 - length` (TRM
+/// 34.5.5.3), byte mode.
 fn h6_function1(slot: &mut HostSlot<'_>, delay: &Delay, tally: &mut HostTally) {
     match cmd52_write(slot, 0, 0x02, 0x02) {
-        Ok(echo) => a1!(tally, "A2_IOE1", Outcome::Pass, "CCCR IOE written 0x02 r5_data={:#04x}", echo),
+        Ok(echo) => a1!(
+            tally,
+            "A2_IOE1",
+            Outcome::Pass,
+            "CCCR IOE written 0x02 r5_data={:#04x}",
+            echo
+        ),
         Err(e) => {
             a1!(tally, "A2_IOE1", Outcome::Fail, "{}", describe(e));
             return;
         }
     }
-    let mut ior = 0u8;
-    for attempt in 1..=40u32 {
-        ior = cmd52_read(slot, 0, 0x03).unwrap_or(0xff);
-        if ior & 0x02 != 0 {
-            a1!(tally, "A2_IOR1", Outcome::Pass, "IOR={:#04x} after {} polls", ior, attempt);
-            break;
+    match wait_function1_ready(|| cmd52_read(slot, 0, 0x03), || delay.delay_millis(50), 40) {
+        Ok(Some((ior, attempt))) => a1!(
+            tally,
+            "A2_IOR1",
+            Outcome::Pass,
+            "IOR={:#04x} after {} polls",
+            ior,
+            attempt
+        ),
+        Ok(None) => {
+            a1!(
+                tally,
+                "A2_IOR1",
+                Outcome::Fail,
+                "function 1 never became ready in 40 polls"
+            );
+            return;
         }
-        delay.delay_millis(50);
-    }
-    if ior & 0x02 == 0 {
-        a1!(tally, "A2_IOR1", Outcome::Fail, "IOR={:#04x}: function 1 never became ready in 2 s", ior);
-        return;
+        Err(error) => {
+            a1!(tally, "A2_IOR1", Outcome::Fail, "{}", describe(error));
+            return;
+        }
     }
     match read_fn1_u32(slot, 0x44) {
-        Ok(token) => a1!(tally, "A2_TOKEN", Outcome::Info, "SLCHOST_SLC0HOST_TOKEN_RDATA raw={:#010x}", token),
-        Err(e) => a1!(tally, "A2_TOKEN", Outcome::Fail, "{}", describe(e)),
+        Ok(token) if (token >> 16) & 0xfff != 0 => a1!(
+            tally,
+            "A2_TOKEN",
+            Outcome::Pass,
+            "SLCHOST_SLC0HOST_TOKEN_RDATA raw={:#010x}",
+            token
+        ),
+        Ok(token) => {
+            a1!(
+                tally,
+                "A2_TOKEN",
+                Outcome::Fail,
+                "no receive credit raw={:#010x}",
+                token
+            );
+            return;
+        }
+        Err(e) => {
+            a1!(tally, "A2_TOKEN", Outcome::Fail, "{}", describe(e));
+            return;
+        }
     }
 
     let mut buffer = Dma64([0; 64]);
@@ -302,7 +337,12 @@ fn h6_function1(slot: &mut HostSlot<'_>, delay: &Delay, tally: &mut HostTally) {
     let dma = match DmaAlignedMut::new(&mut buffer.0) {
         Ok(dma) => dma.unsize(),
         Err(_) => {
-            a1!(tally, "A2_CMD53_WRITE", Outcome::Fail, "buffer is not DMA aligned");
+            a1!(
+                tally,
+                "A2_CMD53_WRITE",
+                Outcome::Fail,
+                "buffer is not DMA aligned"
+            );
             return;
         }
     };
@@ -310,17 +350,45 @@ fn h6_function1(slot: &mut HostSlot<'_>, delay: &Delay, tally: &mut HostTally) {
         Ok(words) => {
             let flags = ((words[0] >> 8) & 0xff) as u8;
             if flags & sdio::SdioError::ALL != 0 {
-                a1!(tally, "A2_CMD53_WRITE", Outcome::Fail, "r5_flags={:#04x} arg={:#010x}", flags, arg);
+                a1!(
+                    tally,
+                    "A2_CMD53_WRITE",
+                    Outcome::Fail,
+                    "r5_flags={:#04x} arg={:#010x}",
+                    flags,
+                    arg
+                );
             } else {
-                a1!(tally, "A2_CMD53_WRITE", Outcome::Pass, "{} bytes to function 1 at {:#07x} arg={:#010x} r5_flags={:#04x} (host side only; the C6 log shows the receive)",
-                    length, 0x1_f800 - length, arg, flags);
+                a1!(
+                    tally,
+                    "A2_CMD53_WRITE",
+                    Outcome::Pass,
+                    "{} bytes to function 1 at {:#07x} arg={:#010x} r5_flags={:#04x} (host side only; the C6 log shows the receive)",
+                    length,
+                    0x1_f800 - length,
+                    arg,
+                    flags
+                );
             }
         }
-        Err(e) => a1!(tally, "A2_CMD53_WRITE", Outcome::Fail, "error={} arg={:#010x}", error_name(&e), arg),
+        Err(e) => a1!(
+            tally,
+            "A2_CMD53_WRITE",
+            Outcome::Fail,
+            "error={} arg={:#010x}",
+            error_name(&e),
+            arg
+        ),
     }
     // Interrupt status as the host sees it (information only).
     match read_fn1_u32(slot, 0x58) {
-        Ok(v) => a1!(tally, "A2_INT_ST", Outcome::Info, "SLCHOST_SLC0HOST_INT_ST raw={:#010x}", v),
+        Ok(v) => a1!(
+            tally,
+            "A2_INT_ST",
+            Outcome::Info,
+            "SLCHOST_SLC0HOST_INT_ST raw={:#010x}",
+            v
+        ),
         Err(e) => a1!(tally, "A2_INT_ST", Outcome::Fail, "{}", describe(e)),
     }
 }
@@ -364,7 +432,11 @@ fn h1_cmd5(slot: &mut HostSlot<'_>, delay: &Delay, tally: &mut HostTally) -> Opt
                 let info = R4Info::decode(r4.ocr);
                 println!(
                     "SDIO-A1 P4 CMD5_TRY INFO run={} attempt={}/{} raw={:#010x} class={:?}",
-                    RUN_ID, attempt, CMD5_TRIES, info.raw, info.class()
+                    RUN_ID,
+                    attempt,
+                    CMD5_TRIES,
+                    info.raw,
+                    info.class()
                 );
                 if info.class() == R4Class::Plausible {
                     inquiry = Some(info);
@@ -443,7 +515,13 @@ fn h1_cmd5(slot: &mut HostSlot<'_>, delay: &Delay, tally: &mut HostTally) -> Opt
                 }
             }
             Err(e) => {
-                a1!(tally, "CMD5", Outcome::Fail, "error={} while polling ready", error_name(&e));
+                a1!(
+                    tally,
+                    "CMD5",
+                    Outcome::Fail,
+                    "error={} while polling ready",
+                    error_name(&e)
+                );
                 return None;
             }
         }
@@ -509,7 +587,14 @@ fn h2_cmd3(slot: &mut HostSlot<'_>, tally: &mut HostTally) -> Option<u16> {
                 );
                 None
             } else {
-                a1!(tally, "CMD3", Outcome::Pass, "rca={:#06x} status={:#06x}", info.rca, info.status);
+                a1!(
+                    tally,
+                    "CMD3",
+                    Outcome::Pass,
+                    "rca={:#06x} status={:#06x}",
+                    info.rca,
+                    info.status
+                );
                 Some(info.rca)
             }
         }
@@ -536,7 +621,14 @@ fn h3_cmd7(slot: &mut HostSlot<'_>, tally: &mut HostTally, rca: u16) -> bool {
             true
         }
         Err(e) => {
-            a1!(tally, "CMD7", Outcome::Fail, "rca={:#06x} error={}", rca, error_name(&e));
+            a1!(
+                tally,
+                "CMD7",
+                Outcome::Fail,
+                "rca={:#06x} error={}",
+                rca,
+                error_name(&e)
+            );
             false
         }
     }
@@ -573,7 +665,13 @@ fn h4_cccr(slot: &mut HostSlot<'_>, tally: &mut HostTally) -> Option<Cccr> {
         }
     }
     let cccr = Cccr { raw };
-    a1!(tally, "CCCR_READ", Outcome::Pass, "bytes=0x00..=0x{:02x}", CCCR_LEN - 1);
+    a1!(
+        tally,
+        "CCCR_READ",
+        Outcome::Pass,
+        "bytes=0x00..=0x{:02x}",
+        CCCR_LEN - 1
+    );
     a1!(
         tally,
         "CCCR_VERSION",
@@ -599,7 +697,11 @@ fn h4_cccr(slot: &mut HostSlot<'_>, tally: &mut HostTally) -> Option<Cccr> {
     a1!(
         tally,
         "CCCR_IOR",
-        if cccr.function_ready_clear() { Outcome::Pass } else { Outcome::Fail },
+        if cccr.function_ready_clear() {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
         "ior={:#04x} (IOR1 and IOR2 must read 0 in A1)",
         cccr.io_ready()
     );
@@ -686,7 +788,13 @@ fn h5_fbr(slot: &mut HostSlot<'_>, tally: &mut HostTally, function: u8) -> Optio
 fn h5_cis(slot: &mut HostSlot<'_>, tally: &mut HostTally, name: &str, ptr: u32) {
     // The CIS lives in the 17-bit function 0 address space.
     if ptr >= 0x2_0000 {
-        a1!(tally, name, Outcome::Fail, "cis_ptr={:#08x} is outside the 17-bit address space", ptr);
+        a1!(
+            tally,
+            name,
+            Outcome::Fail,
+            "cis_ptr={:#08x} is outside the 17-bit address space",
+            ptr
+        );
         return;
     }
     let mut last_error: Option<ReadError> = None;
@@ -766,7 +874,12 @@ fn run_round(
     );
     delay.delay_millis(RESET_HOLD_MS);
     reset.release();
-    a1!(tally, "RESET_RELEASED", Outcome::Pass, "gpio54=high (commanded, level not measured)");
+    a1!(
+        tally,
+        "RESET_RELEASED",
+        Outcome::Pass,
+        "gpio54=high (commanded, level not measured)"
+    );
     println!(
         "SDIO-A1 P4 BOOT_WAIT INFO run={} ms={} (timer only: does not show that the C6 booted)",
         RUN_ID, BOOT_WAIT_MS
@@ -774,9 +887,21 @@ fn run_round(
     delay.delay_millis(BOOT_WAIT_MS);
 
     match slot.send_init_sequence() {
-        Ok(()) => a1!(tally, "INIT_CLOCKS", Outcome::Pass, "80 clocks at {} Hz, 1-bit", CLOCK_HZ),
+        Ok(()) => a1!(
+            tally,
+            "INIT_CLOCKS",
+            Outcome::Pass,
+            "80 clocks at {} Hz, 1-bit",
+            CLOCK_HZ
+        ),
         Err(e) => {
-            a1!(tally, "INIT_CLOCKS", Outcome::Fail, "error={}", error_name(&e));
+            a1!(
+                tally,
+                "INIT_CLOCKS",
+                Outcome::Fail,
+                "error={}",
+                error_name(&e)
+            );
             blocked(&mut tally, "CMD0..CIS", "init clocks failed");
             return tally;
         }
@@ -818,7 +943,14 @@ fn run_round(
 
 /// Records the steps that cannot run because an earlier one failed.
 fn blocked(tally: &mut HostTally, steps: &str, why: &str) {
-    a1!(tally, "REMAINING", Outcome::Blocked, "steps={} not run: {}", steps, why);
+    a1!(
+        tally,
+        "REMAINING",
+        Outcome::Blocked,
+        "steps={} not run: {}",
+        steps,
+        why
+    );
 }
 
 #[main]
@@ -831,17 +963,28 @@ fn main() -> ! {
         en: Output::new(peripherals.GPIO54, Level::Low, OutputConfig::default()),
     };
 
-    // Console: with the factory ESP-IDF bootloader of the Waveshare board, the ROM output used by `esp-println` stays silent until
-    // UART0 has been set up by the esp-hal driver (observed with the p4-hello diagnostic, 2026-11-13). Keep the driver alive; it
-    // does not touch GPIO54.
-    let _console = Uart::new(peripherals.UART0, UartConfig::default().with_baudrate(115_200))
-        .ok()
-        .map(|uart| uart.with_tx(peripherals.GPIO37));
+    // Console: with the factory ESP-IDF bootloader of the Waveshare board, the ROM output used by
+    // `esp-println` stays silent until UART0 has been set up by the esp-hal driver (observed with
+    // the p4-hello diagnostic, 2026-11-13). Keep the driver alive; it does not touch GPIO54.
+    let _console = Uart::new(
+        peripherals.UART0,
+        UartConfig::default().with_baudrate(115_200),
+    )
+    .ok()
+    .map(|uart| uart.with_tx(peripherals.GPIO37));
 
     println!(
-        "SDIO-A1 P4 BOOT INFO run={} sha={} fw=sdio-a1-p4-host scope=A1 mode=1bit hz={} slot=1 \
-         writes=none",
-        RUN_ID, GIT_SHA, CLOCK_HZ
+        "SDIO-A1 P4 BOOT INFO run={} sha={} fw=sdio-a1-p4-host scope={} mode=1bit hz={} slot=1 \
+         writes={}",
+        RUN_ID,
+        GIT_SHA,
+        if A2 == 0 { "A1" } else { "A2a" },
+        CLOCK_HZ,
+        if A2 == 0 {
+            "none"
+        } else {
+            "CCCR_IOE1,CMD53_64_bytes"
+        }
     );
     println!(
         "SDIO-A1 P4 PARAMS INFO run={} reset_hold_ms={} boot_wait_ms={} cmd5_tries={} \
@@ -854,7 +997,13 @@ fn main() -> ! {
     let controller = match SdHostController::new(peripherals.SDHOST, Config::default()) {
         Ok(controller) => controller,
         Err(e) => {
-            a1!(tally, "HOST_INIT", Outcome::Fail, "controller error={:?}", e);
+            a1!(
+                tally,
+                "HOST_INIT",
+                Outcome::Fail,
+                "controller error={:?}",
+                e
+            );
             idle(&delay);
         }
     };
@@ -882,7 +1031,13 @@ fn main() -> ! {
             CLOCK_HZ
         ),
         Err(e) => {
-            a1!(tally, "HOST_INIT", Outcome::Fail, "bus config error={:?}", e);
+            a1!(
+                tally,
+                "HOST_INIT",
+                Outcome::Fail,
+                "bus config error={:?}",
+                e
+            );
             idle(&delay);
         }
     }

@@ -89,12 +89,39 @@ fn r4_common_window_intersects() {
 
 #[test]
 fn r6_error_flags() {
-    let ok = R6Info { rca: 0x0001, status: 0 };
+    let ok = R6Info {
+        rca: 0x0001,
+        status: 0,
+    };
     assert!(!ok.has_error());
-    assert!(R6Info { rca: 1, status: 1 << 15 }.com_crc_error());
-    assert!(R6Info { rca: 1, status: 1 << 14 }.illegal_command());
-    assert!(R6Info { rca: 1, status: 1 << 13 }.error());
-    assert!(R6Info { rca: 1, status: 1 << 13 }.has_error());
+    assert!(
+        R6Info {
+            rca: 1,
+            status: 1 << 15
+        }
+        .com_crc_error()
+    );
+    assert!(
+        R6Info {
+            rca: 1,
+            status: 1 << 14
+        }
+        .illegal_command()
+    );
+    assert!(
+        R6Info {
+            rca: 1,
+            status: 1 << 13
+        }
+        .error()
+    );
+    assert!(
+        R6Info {
+            rca: 1,
+            status: 1 << 13
+        }
+        .has_error()
+    );
 }
 
 // ---- CCCR / FBR ----
@@ -239,7 +266,10 @@ fn cis_all_ones_is_an_immediate_end_tuple_without_tuples() {
 fn cis_tuple_limit_stops_an_endless_chain() {
     // Endless chain of empty tuples (code 0x30, link 0).
     let mut count = 0u32;
-    let limits = CisLimits { max_tuples: 5, max_bytes: 4096 };
+    let limits = CisLimits {
+        max_tuples: 5,
+        max_bytes: 4096,
+    };
     let r = walk_cis(limits, |off| {
         count += 1;
         Ok::<_, ()>(if off % 2 == 0 { 0x30 } else { 0x00 })
@@ -252,7 +282,10 @@ fn cis_tuple_limit_stops_an_endless_chain() {
 #[test]
 fn cis_byte_limit_stops_a_long_chain() {
     let mut count = 0u32;
-    let limits = CisLimits { max_tuples: 255, max_bytes: 16 };
+    let limits = CisLimits {
+        max_tuples: 255,
+        max_bytes: 16,
+    };
     let r = walk_cis(limits, |off| {
         count += 1;
         Ok::<_, ()>(if off % 2 == 0 { 0x30 } else { 0x00 })
@@ -264,7 +297,10 @@ fn cis_byte_limit_stops_a_long_chain() {
 #[test]
 fn cis_body_longer_than_the_limit_is_rejected_without_reading_it() {
     let mut max_off = 0u16;
-    let limits = CisLimits { max_tuples: 8, max_bytes: 32 };
+    let limits = CisLimits {
+        max_tuples: 8,
+        max_bytes: 32,
+    };
     let r = walk_cis(limits, |off| {
         max_off = max_off.max(off);
         Ok::<_, ()>(if off == 0 { 0x15 } else { 0xF0 }) // link 0xF0 = 240 body bytes
@@ -307,9 +343,66 @@ fn cis_keeps_only_the_first_tuples() {
         cis[2 * i] = 0x30;
     }
     cis[40] = 0xFF;
-    let limits = CisLimits { max_tuples: 32, max_bytes: 256 };
+    let limits = CisLimits {
+        max_tuples: 32,
+        max_bytes: 256,
+    };
     let r = walk_cis(limits, |off| Ok::<_, ()>(cis[off as usize]));
     assert_eq!(r.end, CisEnd::EndTuple);
     assert_eq!(r.seen, 20);
     assert_eq!(r.kept as usize, CIS_KEPT);
+}
+
+#[test]
+fn failed_ior_read_never_becomes_ready_or_retries() {
+    let mut reads = 0;
+    let result = wait_function1_ready(
+        || {
+            reads += 1;
+            Err::<u8, _>("response_timeout")
+        },
+        || panic!("error must not retry"),
+        40,
+    );
+    assert_eq!(result, Err("response_timeout"));
+    assert_eq!(reads, 1);
+}
+
+#[test]
+fn ior_polling_returns_the_observed_ready_byte() {
+    let mut values = [0u8, 0, 2].into_iter();
+    let mut waits = 0;
+    let result = wait_function1_ready(|| Ok::<_, ()>(values.next().unwrap()), || waits += 1, 40);
+    assert_eq!(result, Ok(Some((2, 3))));
+    assert_eq!(waits, 2);
+}
+
+#[test]
+fn ior_polling_times_out_at_the_bound() {
+    let (mut reads, mut waits) = (0, 0);
+    let result = wait_function1_ready(
+        || {
+            reads += 1;
+            Ok::<_, ()>(0)
+        },
+        || waits += 1,
+        40,
+    );
+    assert_eq!(result, Ok(None));
+    assert_eq!((reads, waits), (40, 39));
+}
+
+#[test]
+fn a2a_cmd53_argument_is_a_64_byte_incrementing_function1_write() {
+    assert_eq!(cmd53_arg(true, 1, false, true, 0x1f7c0, 64), 0x97ef8040);
+}
+
+#[test]
+fn a2a_rejects_short_long_and_corrupted_packets() {
+    let mut bytes = core::array::from_fn::<_, 64, _>(|i| 0xa0u8.wrapping_add(i as u8));
+    assert!(a2a_packet_matches(&bytes));
+    assert!(!a2a_packet_matches(&bytes[..63]));
+    assert!(!a2a_packet_matches(&[0; 65]));
+    bytes[31] ^= 1;
+    assert!(!a2a_packet_matches(&bytes));
 }

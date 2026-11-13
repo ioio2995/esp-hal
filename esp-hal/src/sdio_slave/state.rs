@@ -7,7 +7,7 @@
 ///
 /// The states a host can observe are modelled separately, see
 /// [`FunctionState`]: whether a function has been enabled by the host, or is
-/// ready, is hardware state that the driver only reads.
+/// ready, is hardware state that the driver observes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum State {
@@ -19,8 +19,7 @@ pub enum State {
     /// reset.
     ///
     /// This state only describes what the driver has configured. It does **not**
-    /// mean that a host can enumerate the card: CMD5, CCCR and CIS access have
-    /// not been demonstrated on hardware. No function is ready to transfer
+    /// mean that a host has enumerated the card. No function is ready to transfer
     /// data.
     BusExposed,
     /// (A2a) The SLC0 receive DMA (host to slave) is armed with a linked list and
@@ -29,6 +28,10 @@ pub enum State {
     /// Only the host to slave direction exists in this state: there is no slave to
     /// host DMA, no interrupt handling and no flow control.
     Function1Receiving,
+    /// One packet completed. The receive buffer is owned by the CPU.
+    Function1Received,
+    /// A DMA error or stop timeout. Resources remain owned by the driver.
+    Function1ReceiveError,
 }
 
 /// State of one SDIO I/O function, as observable on the bus.
@@ -38,12 +41,11 @@ pub enum FunctionState {
     /// The host has not enabled the function (CCCR `IOEx` is 0).
     Disabled,
     /// The host has enabled the function but the slave has not declared it
-    /// ready (CCCR `IORx` is 0). This is the only enabled state reachable in
-    /// the bring-up driver.
+    /// ready (CCCR `IORx` is 0).
     EnabledByHost,
     /// The function is enabled and declared ready to transfer.
     ///
-    /// The bring-up driver never causes this state: it never sets `IORx`.
+    /// Function 1 can enter this state after a receive buffer is armed.
     Ready,
 }
 
@@ -54,9 +56,16 @@ pub enum FunctionState {
 pub enum Error {
     /// The operation is not allowed in the current [`State`].
     InvalidState,
-    /// A DMA buffer is empty, not word-sized, or larger than one descriptor can
-    /// describe (the size field is 14 bits wide).
+    /// A DMA buffer is empty or larger than 16380 bytes.
     InvalidBuffer,
+    /// A descriptor or buffer is outside internal DMA-accessible RAM.
+    UnsupportedMemory,
+    /// DMA write-back has an invalid owner, EOF, size, or length.
+    InvalidDescriptor,
+    /// The receive DMA reported an overflow or a descriptor error.
+    DmaFault,
+    /// The receive DMA did not become idle within the polling bound.
+    DmaStopTimeout,
 }
 
 impl State {
@@ -67,14 +76,18 @@ impl State {
             (State::ControllerReady, State::BusExposed)
                 | (State::BusExposed, State::ControllerReady)
                 | (State::BusExposed, State::Function1Receiving)
-                | (State::Function1Receiving, State::BusExposed)
+                | (State::Function1Receiving, State::Function1Received)
+                | (State::Function1Receiving, State::Function1ReceiveError)
+                | (State::Function1Received, State::ControllerReady)
+                | (State::Function1Received, State::Function1ReceiveError)
+                | (State::Function1ReceiveError, State::ControllerReady)
                 | (State::Function1Receiving, State::ControllerReady)
         )
     }
 
     /// Whether the SDIO pads are routed to the controller in this state.
     pub const fn pads_routed(self) -> bool {
-        matches!(self, State::BusExposed | State::Function1Receiving)
+        !matches!(self, State::ControllerReady)
     }
 
     /// Whether the driver may declare a function ready (`IOREADY1`) in this
@@ -96,3 +109,29 @@ pub const fn function_state(enabled_by_host: bool, ready: bool) -> FunctionState
         (true, true) => FunctionState::Ready,
     }
 }
+
+/// Bounds polling without interpreting a request to stop as confirmation.
+pub(super) fn wait_for_idle(mut parked: impl FnMut() -> bool) -> bool {
+    for _ in 0..10_000 {
+        if parked() {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidState => "operation is not allowed in this state",
+            Self::InvalidBuffer => "receive buffer must contain 1..=4095 words",
+            Self::UnsupportedMemory => "DMA storage must be in internal DRAM",
+            Self::InvalidDescriptor => "invalid DMA descriptor write-back",
+            Self::DmaFault => "DMA overflow or descriptor fault",
+            Self::DmaStopTimeout => "DMA stop did not reach idle within the polling bound",
+        })
+    }
+}
+
+impl core::error::Error for Error {}

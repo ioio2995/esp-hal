@@ -1,0 +1,362 @@
+From ee575601d138a9c90826e2b2cadd507d681fee8a Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 13 Nov 2026 19:22:53 +0100
+Subject: [PATCH] fix(esp32c6): correct SLC token fields and read-only status
+
+Use TRM v1.2 chapter 34 and Espressif v5.4.2 slc_reg.h as hardware references. Override only C6 metadata; regenerate its PAC and add host bit-packing regressions. No peripheral or DMA is accessed by the tests.
+---
+ esp32c6/src/slc/slc0rx_link.rs      |  7 ----
+ esp32c6/src/slc/slc0token1.rs       |  4 +-
+ esp32c6/src/slc/slc0tx_link.rs      |  7 ----
+ esp32c6/src/slc/slc1rx_link.rs      |  7 ----
+ esp32c6/src/slc/slc1token1.rs       | 40 ++++++++++----------
+ esp32c6/src/slc/slc1tx_link.rs      |  7 ----
+ esp32c6/src/slc/slc_rx_dscr_conf.rs |  8 ++--
+ esp32c6/svd/patches/esp32c6.yaml    | 40 ++++++++++++++++++++
+ esp32c6/tests/slc_fields.rs         | 58 +++++++++++++++++++++++++++++
+ 9 files changed, 124 insertions(+), 54 deletions(-)
+ create mode 100644 esp32c6/tests/slc_fields.rs
+
+diff --git a/esp32c6/src/slc/slc0rx_link.rs b/esp32c6/src/slc/slc0rx_link.rs
+index 0c0e7f31..3c330f38 100644
+--- a/esp32c6/src/slc/slc0rx_link.rs
++++ b/esp32c6/src/slc/slc0rx_link.rs
+@@ -16,8 +16,6 @@ pub type SDIO_SLC0_RXLINK_RESTART_R = crate::BitReader;
+ pub type SDIO_SLC0_RXLINK_RESTART_W<'a, REG> = crate::BitWriter<'a, REG>;
+ #[doc = "Field `SDIO_SLC0_RXLINK_PARK` reader - Represents SLC0 RX linked list FSM state."]
+ pub type SDIO_SLC0_RXLINK_PARK_R = crate::BitReader;
+-#[doc = "Field `SDIO_SLC0_RXLINK_PARK` writer - Represents SLC0 RX linked list FSM state."]
+-pub type SDIO_SLC0_RXLINK_PARK_W<'a, REG> = crate::BitWriter<'a, REG>;
+ impl R {
+     #[doc = "Bit 28 - Configures whether to stop SLC0 RX linked list operation."]
+     #[inline(always)]
+@@ -67,11 +65,6 @@ impl W {
+     pub fn sdio_slc0_rxlink_restart(&mut self) -> SDIO_SLC0_RXLINK_RESTART_W<'_, SLC0RX_LINK_SPEC> {
+         SDIO_SLC0_RXLINK_RESTART_W::new(self, 30)
+     }
+-    #[doc = "Bit 31 - Represents SLC0 RX linked list FSM state."]
+-    #[inline(always)]
+-    pub fn sdio_slc0_rxlink_park(&mut self) -> SDIO_SLC0_RXLINK_PARK_W<'_, SLC0RX_LINK_SPEC> {
+-        SDIO_SLC0_RXLINK_PARK_W::new(self, 31)
+-    }
+ }
+ #[doc = "SLC0 RX linked list configuration\n\nYou can [`read`](crate::Reg::read) this register and get [`slc0rx_link::R`](R). You can [`reset`](crate::Reg::reset), [`write`](crate::Reg::write), [`write_with_zero`](crate::Reg::write_with_zero) this register using [`slc0rx_link::W`](W). You can also [`modify`](crate::Reg::modify) this register. See [API](https://docs.rs/svd2rust/#read--modify--write-api)."]
+ pub struct SLC0RX_LINK_SPEC;
+diff --git a/esp32c6/src/slc/slc0token1.rs b/esp32c6/src/slc/slc0token1.rs
+index a59535a3..3b759bdf 100644
+--- a/esp32c6/src/slc/slc0token1.rs
++++ b/esp32c6/src/slc/slc0token1.rs
+@@ -3,7 +3,7 @@ pub type R = crate::R<SLC0TOKEN1_SPEC>;
+ #[doc = "Register `SLC0TOKEN1` writer"]
+ pub type W = crate::W<SLC0TOKEN1_SPEC>;
+ #[doc = "Field `SDIO_SLC0_TOKEN1_WDATA` writer - Configures SLC0 token 1 value."]
+-pub type SDIO_SLC0_TOKEN1_WDATA_W<'a, REG> = crate::FieldWriter<'a, REG, 11, u16>;
++pub type SDIO_SLC0_TOKEN1_WDATA_W<'a, REG> = crate::FieldWriter<'a, REG, 12, u16>;
+ #[doc = "Field `SDIO_SLC0_TOKEN1_WR` writer - Configures this bit to 1 to write SDIO_SLC0_TOKEN1_WDATA into SDIO_SLC0_TOKEN1."]
+ pub type SDIO_SLC0_TOKEN1_WR_W<'a, REG> = crate::BitWriter<'a, REG>;
+ #[doc = "Field `SDIO_SLC0_TOKEN1_INC` writer - Configures this bit to 1 to add 1 to SDIO_SLC0_TOKEN1."]
+@@ -28,7 +28,7 @@ impl core::fmt::Debug for R {
+     }
+ }
+ impl W {
+-    #[doc = "Bits 0:10 - Configures SLC0 token 1 value."]
++    #[doc = "Bits 0:11 - Configures SLC0 token 1 value."]
+     #[inline(always)]
+     pub fn sdio_slc0_token1_wdata(&mut self) -> SDIO_SLC0_TOKEN1_WDATA_W<'_, SLC0TOKEN1_SPEC> {
+         SDIO_SLC0_TOKEN1_WDATA_W::new(self, 0)
+diff --git a/esp32c6/src/slc/slc0tx_link.rs b/esp32c6/src/slc/slc0tx_link.rs
+index ae5dc872..65ab0e15 100644
+--- a/esp32c6/src/slc/slc0tx_link.rs
++++ b/esp32c6/src/slc/slc0tx_link.rs
+@@ -16,8 +16,6 @@ pub type SDIO_SLC0_TXLINK_RESTART_R = crate::BitReader;
+ pub type SDIO_SLC0_TXLINK_RESTART_W<'a, REG> = crate::BitWriter<'a, REG>;
+ #[doc = "Field `SDIO_SLC0_TXLINK_PARK` reader - Represents SLC0 TX linked list FSM state."]
+ pub type SDIO_SLC0_TXLINK_PARK_R = crate::BitReader;
+-#[doc = "Field `SDIO_SLC0_TXLINK_PARK` writer - Represents SLC0 TX linked list FSM state."]
+-pub type SDIO_SLC0_TXLINK_PARK_W<'a, REG> = crate::BitWriter<'a, REG>;
+ impl R {
+     #[doc = "Bit 28 - Configures whether to stop SLC0 TX linked list operation."]
+     #[inline(always)]
+@@ -67,11 +65,6 @@ impl W {
+     pub fn sdio_slc0_txlink_restart(&mut self) -> SDIO_SLC0_TXLINK_RESTART_W<'_, SLC0TX_LINK_SPEC> {
+         SDIO_SLC0_TXLINK_RESTART_W::new(self, 30)
+     }
+-    #[doc = "Bit 31 - Represents SLC0 TX linked list FSM state."]
+-    #[inline(always)]
+-    pub fn sdio_slc0_txlink_park(&mut self) -> SDIO_SLC0_TXLINK_PARK_W<'_, SLC0TX_LINK_SPEC> {
+-        SDIO_SLC0_TXLINK_PARK_W::new(self, 31)
+-    }
+ }
+ #[doc = "SLC0 TX linked list configuration\n\nYou can [`read`](crate::Reg::read) this register and get [`slc0tx_link::R`](R). You can [`reset`](crate::Reg::reset), [`write`](crate::Reg::write), [`write_with_zero`](crate::Reg::write_with_zero) this register using [`slc0tx_link::W`](W). You can also [`modify`](crate::Reg::modify) this register. See [API](https://docs.rs/svd2rust/#read--modify--write-api)."]
+ pub struct SLC0TX_LINK_SPEC;
+diff --git a/esp32c6/src/slc/slc1rx_link.rs b/esp32c6/src/slc/slc1rx_link.rs
+index 7673b5b9..9b69ebb3 100644
+--- a/esp32c6/src/slc/slc1rx_link.rs
++++ b/esp32c6/src/slc/slc1rx_link.rs
+@@ -16,8 +16,6 @@ pub type SDIO_SLC1_RXLINK_RESTART_R = crate::BitReader;
+ pub type SDIO_SLC1_RXLINK_RESTART_W<'a, REG> = crate::BitWriter<'a, REG>;
+ #[doc = "Field `SDIO_SLC1_RXLINK_PARK` reader - Represents SLC1 RX linked list FSM state."]
+ pub type SDIO_SLC1_RXLINK_PARK_R = crate::BitReader;
+-#[doc = "Field `SDIO_SLC1_RXLINK_PARK` writer - Represents SLC1 RX linked list FSM state."]
+-pub type SDIO_SLC1_RXLINK_PARK_W<'a, REG> = crate::BitWriter<'a, REG>;
+ impl R {
+     #[doc = "Bit 28 - Configures whether to stop SLC1 RX linked list operation."]
+     #[inline(always)]
+@@ -67,11 +65,6 @@ impl W {
+     pub fn sdio_slc1_rxlink_restart(&mut self) -> SDIO_SLC1_RXLINK_RESTART_W<'_, SLC1RX_LINK_SPEC> {
+         SDIO_SLC1_RXLINK_RESTART_W::new(self, 30)
+     }
+-    #[doc = "Bit 31 - Represents SLC1 RX linked list FSM state."]
+-    #[inline(always)]
+-    pub fn sdio_slc1_rxlink_park(&mut self) -> SDIO_SLC1_RXLINK_PARK_W<'_, SLC1RX_LINK_SPEC> {
+-        SDIO_SLC1_RXLINK_PARK_W::new(self, 31)
+-    }
+ }
+ #[doc = "SLC1 RX linked list configuration\n\nYou can [`read`](crate::Reg::read) this register and get [`slc1rx_link::R`](R). You can [`reset`](crate::Reg::reset), [`write`](crate::Reg::write), [`write_with_zero`](crate::Reg::write_with_zero) this register using [`slc1rx_link::W`](W). You can also [`modify`](crate::Reg::modify) this register. See [API](https://docs.rs/svd2rust/#read--modify--write-api)."]
+ pub struct SLC1RX_LINK_SPEC;
+diff --git a/esp32c6/src/slc/slc1token1.rs b/esp32c6/src/slc/slc1token1.rs
+index e3824ba2..f276191f 100644
+--- a/esp32c6/src/slc/slc1token1.rs
++++ b/esp32c6/src/slc/slc1token1.rs
+@@ -3,52 +3,52 @@ pub type R = crate::R<SLC1TOKEN1_SPEC>;
+ #[doc = "Register `SLC1TOKEN1` writer"]
+ pub type W = crate::W<SLC1TOKEN1_SPEC>;
+ #[doc = "Field `SDIO_SLC1_TOKEN1_WDATA` writer - Configures SLC1 token1 value."]
+-pub type SDIO_SLC1_TOKEN1_WDATA_W<'a, REG> = crate::FieldWriter<'a, REG, 11, u16>;
+-#[doc = "Field `SDIO_SLC0_TOKEN1_WR` writer - Configures this bit to 1 to write SDIO_SLC1_TOKEN1_WDATA into SDIO_SLC1_TOKEN1."]
+-pub type SDIO_SLC0_TOKEN1_WR_W<'a, REG> = crate::BitWriter<'a, REG>;
+-#[doc = "Field `SDIO_SLC0_TOKEN1_INC` writer - Configures this bit to 1 to add 1 to SDIO_SLC1_TOKEN1."]
+-pub type SDIO_SLC0_TOKEN1_INC_W<'a, REG> = crate::BitWriter<'a, REG>;
+-#[doc = "Field `SDIO_SLC0_TOKEN1_INC_MORE` writer - Configures this bit to 1 to add the value of SDIO_SLC1_TOKEN1_WDATA to SDIO_SLC1_TOKEN1."]
+-pub type SDIO_SLC0_TOKEN1_INC_MORE_W<'a, REG> = crate::BitWriter<'a, REG>;
+-#[doc = "Field `SDIO_SLC0_TOKEN1` reader - Represents the SLC1 accumulated number of buffers for receiving packets."]
+-pub type SDIO_SLC0_TOKEN1_R = crate::FieldReader<u16>;
++pub type SDIO_SLC1_TOKEN1_WDATA_W<'a, REG> = crate::FieldWriter<'a, REG, 12, u16>;
++#[doc = "Field `SDIO_SLC1_TOKEN1_WR` writer - Configures this bit to 1 to write SDIO_SLC1_TOKEN1_WDATA into SDIO_SLC1_TOKEN1."]
++pub type SDIO_SLC1_TOKEN1_WR_W<'a, REG> = crate::BitWriter<'a, REG>;
++#[doc = "Field `SDIO_SLC1_TOKEN1_INC` writer - Configures this bit to 1 to add 1 to SDIO_SLC1_TOKEN1."]
++pub type SDIO_SLC1_TOKEN1_INC_W<'a, REG> = crate::BitWriter<'a, REG>;
++#[doc = "Field `SDIO_SLC1_TOKEN1_INC_MORE` writer - Configures this bit to 1 to add the value of SDIO_SLC1_TOKEN1_WDATA to SDIO_SLC1_TOKEN1."]
++pub type SDIO_SLC1_TOKEN1_INC_MORE_W<'a, REG> = crate::BitWriter<'a, REG>;
++#[doc = "Field `SDIO_SLC1_TOKEN1` reader - Represents the SLC1 accumulated number of buffers for receiving packets."]
++pub type SDIO_SLC1_TOKEN1_R = crate::FieldReader<u16>;
+ impl R {
+     #[doc = "Bits 16:27 - Represents the SLC1 accumulated number of buffers for receiving packets."]
+     #[inline(always)]
+-    pub fn sdio_slc0_token1(&self) -> SDIO_SLC0_TOKEN1_R {
+-        SDIO_SLC0_TOKEN1_R::new(((self.bits >> 16) & 0x0fff) as u16)
++    pub fn sdio_slc1_token1(&self) -> SDIO_SLC1_TOKEN1_R {
++        SDIO_SLC1_TOKEN1_R::new(((self.bits >> 16) & 0x0fff) as u16)
+     }
+ }
+ #[cfg(feature = "impl-register-debug")]
+ impl core::fmt::Debug for R {
+     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+         f.debug_struct("SLC1TOKEN1")
+-            .field("sdio_slc0_token1", &self.sdio_slc0_token1())
++            .field("sdio_slc1_token1", &self.sdio_slc1_token1())
+             .finish()
+     }
+ }
+ impl W {
+-    #[doc = "Bits 0:10 - Configures SLC1 token1 value."]
++    #[doc = "Bits 0:11 - Configures SLC1 token1 value."]
+     #[inline(always)]
+     pub fn sdio_slc1_token1_wdata(&mut self) -> SDIO_SLC1_TOKEN1_WDATA_W<'_, SLC1TOKEN1_SPEC> {
+         SDIO_SLC1_TOKEN1_WDATA_W::new(self, 0)
+     }
+     #[doc = "Bit 12 - Configures this bit to 1 to write SDIO_SLC1_TOKEN1_WDATA into SDIO_SLC1_TOKEN1."]
+     #[inline(always)]
+-    pub fn sdio_slc0_token1_wr(&mut self) -> SDIO_SLC0_TOKEN1_WR_W<'_, SLC1TOKEN1_SPEC> {
+-        SDIO_SLC0_TOKEN1_WR_W::new(self, 12)
++    pub fn sdio_slc1_token1_wr(&mut self) -> SDIO_SLC1_TOKEN1_WR_W<'_, SLC1TOKEN1_SPEC> {
++        SDIO_SLC1_TOKEN1_WR_W::new(self, 12)
+     }
+     #[doc = "Bit 13 - Configures this bit to 1 to add 1 to SDIO_SLC1_TOKEN1."]
+     #[inline(always)]
+-    pub fn sdio_slc0_token1_inc(&mut self) -> SDIO_SLC0_TOKEN1_INC_W<'_, SLC1TOKEN1_SPEC> {
+-        SDIO_SLC0_TOKEN1_INC_W::new(self, 13)
++    pub fn sdio_slc1_token1_inc(&mut self) -> SDIO_SLC1_TOKEN1_INC_W<'_, SLC1TOKEN1_SPEC> {
++        SDIO_SLC1_TOKEN1_INC_W::new(self, 13)
+     }
+     #[doc = "Bit 14 - Configures this bit to 1 to add the value of SDIO_SLC1_TOKEN1_WDATA to SDIO_SLC1_TOKEN1."]
+     #[inline(always)]
+-    pub fn sdio_slc0_token1_inc_more(
++    pub fn sdio_slc1_token1_inc_more(
+         &mut self,
+-    ) -> SDIO_SLC0_TOKEN1_INC_MORE_W<'_, SLC1TOKEN1_SPEC> {
+-        SDIO_SLC0_TOKEN1_INC_MORE_W::new(self, 14)
++    ) -> SDIO_SLC1_TOKEN1_INC_MORE_W<'_, SLC1TOKEN1_SPEC> {
++        SDIO_SLC1_TOKEN1_INC_MORE_W::new(self, 14)
+     }
+ }
+ #[doc = "SLC1 receiving buffer configuration\n\nYou can [`read`](crate::Reg::read) this register and get [`slc1token1::R`](R). You can [`reset`](crate::Reg::reset), [`write`](crate::Reg::write), [`write_with_zero`](crate::Reg::write_with_zero) this register using [`slc1token1::W`](W). You can also [`modify`](crate::Reg::modify) this register. See [API](https://docs.rs/svd2rust/#read--modify--write-api)."]
+diff --git a/esp32c6/src/slc/slc1tx_link.rs b/esp32c6/src/slc/slc1tx_link.rs
+index 61e9d291..6444b98e 100644
+--- a/esp32c6/src/slc/slc1tx_link.rs
++++ b/esp32c6/src/slc/slc1tx_link.rs
+@@ -16,8 +16,6 @@ pub type SDIO_SLC1_TXLINK_RESTART_R = crate::BitReader;
+ pub type SDIO_SLC1_TXLINK_RESTART_W<'a, REG> = crate::BitWriter<'a, REG>;
+ #[doc = "Field `SDIO_SLC1_TXLINK_PARK` reader - Represents SLC1 TX linked list FSM state."]
+ pub type SDIO_SLC1_TXLINK_PARK_R = crate::BitReader;
+-#[doc = "Field `SDIO_SLC1_TXLINK_PARK` writer - Represents SLC1 TX linked list FSM state."]
+-pub type SDIO_SLC1_TXLINK_PARK_W<'a, REG> = crate::BitWriter<'a, REG>;
+ impl R {
+     #[doc = "Bit 28 - Configures whether to stop SLC1 TX linked list operation."]
+     #[inline(always)]
+@@ -67,11 +65,6 @@ impl W {
+     pub fn sdio_slc1_txlink_restart(&mut self) -> SDIO_SLC1_TXLINK_RESTART_W<'_, SLC1TX_LINK_SPEC> {
+         SDIO_SLC1_TXLINK_RESTART_W::new(self, 30)
+     }
+-    #[doc = "Bit 31 - Represents SLC1 TX linked list FSM state."]
+-    #[inline(always)]
+-    pub fn sdio_slc1_txlink_park(&mut self) -> SDIO_SLC1_TXLINK_PARK_W<'_, SLC1TX_LINK_SPEC> {
+-        SDIO_SLC1_TXLINK_PARK_W::new(self, 31)
+-    }
+ }
+ #[doc = "SLC1 TX linked list configuration\n\nYou can [`read`](crate::Reg::read) this register and get [`slc1tx_link::R`](R). You can [`reset`](crate::Reg::reset), [`write`](crate::Reg::write), [`write_with_zero`](crate::Reg::write_with_zero) this register using [`slc1tx_link::W`](W). You can also [`modify`](crate::Reg::modify) this register. See [API](https://docs.rs/svd2rust/#read--modify--write-api)."]
+ pub struct SLC1TX_LINK_SPEC;
+diff --git a/esp32c6/src/slc/slc_rx_dscr_conf.rs b/esp32c6/src/slc/slc_rx_dscr_conf.rs
+index 07069d4c..af083656 100644
+--- a/esp32c6/src/slc/slc_rx_dscr_conf.rs
++++ b/esp32c6/src/slc/slc_rx_dscr_conf.rs
+@@ -7,10 +7,10 @@ pub type SDIO_SLC0_TOKEN_NO_REPLACE_R = crate::BitReader;
+ #[doc = "Field `SDIO_SLC0_TOKEN_NO_REPLACE` writer - Please initialize to 1, and do not modify it."]
+ pub type SDIO_SLC0_TOKEN_NO_REPLACE_W<'a, REG> = crate::BitWriter<'a, REG>;
+ impl R {
+-    #[doc = "Bit 1 - Please initialize to 1, and do not modify it."]
++    #[doc = "Bit 0 - Please initialize to 1, and do not modify it."]
+     #[inline(always)]
+     pub fn sdio_slc0_token_no_replace(&self) -> SDIO_SLC0_TOKEN_NO_REPLACE_R {
+-        SDIO_SLC0_TOKEN_NO_REPLACE_R::new(((self.bits >> 1) & 1) != 0)
++        SDIO_SLC0_TOKEN_NO_REPLACE_R::new((self.bits & 1) != 0)
+     }
+ }
+ #[cfg(feature = "impl-register-debug")]
+@@ -25,12 +25,12 @@ impl core::fmt::Debug for R {
+     }
+ }
+ impl W {
+-    #[doc = "Bit 1 - Please initialize to 1, and do not modify it."]
++    #[doc = "Bit 0 - Please initialize to 1, and do not modify it."]
+     #[inline(always)]
+     pub fn sdio_slc0_token_no_replace(
+         &mut self,
+     ) -> SDIO_SLC0_TOKEN_NO_REPLACE_W<'_, SLC_RX_DSCR_CONF_SPEC> {
+-        SDIO_SLC0_TOKEN_NO_REPLACE_W::new(self, 1)
++        SDIO_SLC0_TOKEN_NO_REPLACE_W::new(self, 0)
+     }
+ }
+ #[doc = "DMA slave to host configuration register\n\nYou can [`read`](crate::Reg::read) this register and get [`slc_rx_dscr_conf::R`](R). You can [`reset`](crate::Reg::reset), [`write`](crate::Reg::write), [`write_with_zero`](crate::Reg::write_with_zero) this register using [`slc_rx_dscr_conf::W`](W). You can also [`modify`](crate::Reg::modify) this register. See [API](https://docs.rs/svd2rust/#read--modify--write-api)."]
+diff --git a/esp32c6/svd/patches/esp32c6.yaml b/esp32c6/svd/patches/esp32c6.yaml
+index b5ebe102..d4181876 100644
+--- a/esp32c6/svd/patches/esp32c6.yaml
++++ b/esp32c6/svd/patches/esp32c6.yaml
+@@ -365,3 +365,43 @@ HINF:
+       _modify:
+         CIS_CONF_W0:
+           name: CIS_CONF_W
++
++# ESP32-C6 TRM v1.2 registers 34.8/34.10/34.12/34.14/34.16/34.17/34.19. These overrides
++# are C6-specific; other consumers of common_patches/slc.yaml are unchanged.
++SLC:
++  SLC_RX_DSCR_CONF:
++    _modify:
++      SDIO_SLC0_TOKEN_NO_REPLACE:
++        bitOffset: 0
++  SLC0TOKEN1:
++    _modify:
++      SDIO_SLC0_TOKEN1_WDATA:
++        bitWidth: 12
++  SLC1TOKEN1:
++    _modify:
++      SDIO_SLC1_TOKEN1_WDATA:
++        bitWidth: 12
++      SDIO_SLC0_TOKEN1_WR:
++        name: SDIO_SLC1_TOKEN1_WR
++      SDIO_SLC0_TOKEN1_INC:
++        name: SDIO_SLC1_TOKEN1_INC
++      SDIO_SLC0_TOKEN1_INC_MORE:
++        name: SDIO_SLC1_TOKEN1_INC_MORE
++      SDIO_SLC0_TOKEN1:
++        name: SDIO_SLC1_TOKEN1
++  SLC0RX_LINK:
++    _modify:
++      SDIO_SLC0_RXLINK_PARK:
++        access: read-only
++  SLC0TX_LINK:
++    _modify:
++      SDIO_SLC0_TXLINK_PARK:
++        access: read-only
++  SLC1RX_LINK:
++    _modify:
++      SDIO_SLC1_RXLINK_PARK:
++        access: read-only
++  SLC1TX_LINK:
++    _modify:
++      SDIO_SLC1_TXLINK_PARK:
++        access: read-only
+diff --git a/esp32c6/tests/slc_fields.rs b/esp32c6/tests/slc_fields.rs
+new file mode 100644
+index 00000000..293fa0c5
+--- /dev/null
++++ b/esp32c6/tests/slc_fields.rs
+@@ -0,0 +1,58 @@
++//! Host-only bit-packing regressions. All registers below live in local RAM;
++//! no peripheral address is accessed and no DMA is emulated.
++use core::cell::UnsafeCell;
++
++use esp32c6::{
++    generic::{Reg, RegisterSpec},
++    slc,
++};
++
++fn register<REG: RegisterSpec<Ux = u32>>(cell: &UnsafeCell<u32>) -> &Reg<REG> {
++    assert_eq!(
++        core::mem::size_of::<Reg<REG>>(),
++        core::mem::size_of::<UnsafeCell<u32>>()
++    );
++    assert_eq!(
++        core::mem::align_of::<Reg<REG>>(),
++        core::mem::align_of::<UnsafeCell<u32>>()
++    );
++    // Reg and its VolatileCell are transparent wrappers around UnsafeCell<u32>.
++    // The returned reference borrows this local allocation, not a peripheral.
++    unsafe { &*(cell as *const UnsafeCell<u32>).cast::<Reg<REG>>() }
++}
++
++#[test]
++fn token_no_replace_uses_bit_zero_and_preserves_other_bits() {
++    let cell = UnsafeCell::new(0x0203_701a);
++    let reg = register::<slc::slc_rx_dscr_conf::SLC_RX_DSCR_CONF_SPEC>(&cell);
++    reg.modify(|_, w| w.sdio_slc0_token_no_replace().set_bit());
++    assert_eq!(reg.read().bits(), 0x0203_701b);
++    assert!(reg.read().sdio_slc0_token_no_replace().bit_is_set());
++}
++
++#[test]
++fn slc0_token_write_data_has_twelve_bits() {
++    let cell = UnsafeCell::new(0);
++    let reg = register::<slc::slc0token1::SLC0TOKEN1_SPEC>(&cell);
++    reg.write(|w| unsafe {
++        w.sdio_slc0_token1_wdata()
++            .bits(0xfff)
++            .sdio_slc0_token1_wr()
++            .set_bit()
++    });
++    assert_eq!(reg.read().bits(), 0x1fff);
++}
++
++#[test]
++fn slc1_token_fields_use_the_slc1_names_and_twelve_bit_data() {
++    let cell = UnsafeCell::new(0x0abc_0000);
++    let reg = register::<slc::slc1token1::SLC1TOKEN1_SPEC>(&cell);
++    assert_eq!(reg.read().sdio_slc1_token1().bits(), 0xabc);
++    reg.write(|w| unsafe {
++        w.sdio_slc1_token1_wdata().bits(0xfff);
++        w.sdio_slc1_token1_wr().set_bit();
++        w.sdio_slc1_token1_inc().set_bit();
++        w.sdio_slc1_token1_inc_more().set_bit()
++    });
++    assert_eq!(reg.read().bits(), 0x7fff);
++}

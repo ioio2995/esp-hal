@@ -542,10 +542,7 @@ impl CisReport {
 /// `code`, `link`, then `link` body bytes. `CISTPL_NULL` is a single byte. The walk never reads
 /// more than [`CisLimits::max_bytes`] bytes of header and body together, and the body bytes beyond
 /// [`CIS_HEAD`] are skipped, not read.
-pub fn walk_cis<E>(
-    limits: CisLimits,
-    mut read: impl FnMut(u16) -> Result<u8, E>,
-) -> CisReport {
+pub fn walk_cis<E>(limits: CisLimits, mut read: impl FnMut(u16) -> Result<u8, E>) -> CisReport {
     let mut report = CisReport {
         tuples: [CisTuple::default(); CIS_KEPT],
         kept: 0,
@@ -627,4 +624,48 @@ pub fn walk_cis<E>(
         report.seen += 1;
         offset = body_end as u16;
     }
+}
+
+/// Polls IOR1 with a bound. An I/O error terminates immediately and is preserved.
+pub fn wait_function1_ready<E>(
+    mut read: impl FnMut() -> Result<u8, E>,
+    mut wait: impl FnMut(),
+    attempts: u32,
+) -> Result<Option<(u8, u32)>, E> {
+    for attempt in 1..=attempts {
+        let ior = read()?;
+        if ior & 0x02 != 0 {
+            return Ok(Some((ior, attempt)));
+        }
+        if attempt < attempts {
+            wait();
+        }
+    }
+    Ok(None)
+}
+
+/// Encodes CMD53 in byte or block mode.
+pub const fn cmd53_arg(
+    write: bool,
+    function: u8,
+    block: bool,
+    incrementing: bool,
+    addr: u32,
+    count: u32,
+) -> u32 {
+    (write as u32) << 31
+        | ((function as u32) & 7) << 28
+        | (block as u32) << 27
+        | (incrementing as u32) << 26
+        | (addr & 0x1_ffff) << 9
+        | (count & 0x1ff)
+}
+
+/// Validates the single A2a packet against the host's 64-byte pattern.
+pub fn a2a_packet_matches(bytes: &[u8]) -> bool {
+    bytes.len() == 64
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, byte)| *byte == 0xa0u8.wrapping_add(i as u8))
 }
