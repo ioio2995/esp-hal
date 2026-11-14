@@ -669,3 +669,14 @@ pub fn a2a_packet_matches(bytes: &[u8]) -> bool {
             .enumerate()
             .all(|(i, byte)| *byte == 0xa0u8.wrapping_add(i as u8))
 }
+
+/// Available slave-to-host bytes, modulo the 20-bit SLC0 length accumulator.
+/// The host updates `consumed` only after a successful CMD53 read.
+pub const fn available_packet_bytes(published: u32, consumed: u32) -> u32 {
+    published.wrapping_sub(consumed) & 0x000f_ffff
+}
+
+/// Exact 64-byte A2b test payload, distinct from the A2a payload.
+pub fn a2b_packet_matches(bytes: &[u8]) -> bool {
+    bytes.len() == 64 && bytes.iter().enumerate().all(|(i, b)| *b == 0x40 + i as u8)
+}

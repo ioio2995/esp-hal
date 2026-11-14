@@ -2,8 +2,9 @@
 
 Status: A1 enumeration and one 64-byte A2a transfer were reported by the developer
 for source `785357be3d2ab323e57f357dcc4d1e106b33b36d`. The corrections described
-here have not been exercised on hardware. No A2b, IRQ, or async implementation
-is included.
+here have not been exercised on hardware. This document describes the A2a
+receive path. The later [bidirectional extension](esp32c6-sdio-bidirectional.md)
+adds A2b, SLC0 IRQ completion, and async waits; it is not hardware-qualified.
 
 ## Ownership and completion
 
@@ -42,6 +43,10 @@ then return the two exclusive static borrows once. The caller may explicitly
 re-enable and arm again; the host must retain its consumed-credit count modulo
 4096 (or both peers must explicitly resynchronize). There is no automatic queue
 or flow-control API.
+
+The bidirectional extension also adds `finish_receive()` after validated
+completion. It confirms DMA shutdown and returns storage without disconnecting
+the pads. A new arm remains explicit; no memory is returned on a stop timeout.
 
 If Drop cannot establish idle, it retains the clock reference and does not
 return the static storage. This deliberately fails closed; a timeout is not

@@ -1,11 +1,12 @@
 # ESP32-C6 SDIO Slave — Native Rust bring-up
 
-Status: **A1 enumeration and a first A2a receive path are implemented.**
+Status: **A1 enumeration and single-packet SLC0 transfers in both directions are implemented.**
 A1 enumeration and a 64-byte A2a transfer were reported by the developer for
 `785357be3d2ab323e57f357dcc4d1e106b33b36d`. Corrections after that revision
 are not hardware-qualified. The current DMA lifecycle and safety contract are
-in [A2a](esp32c6-sdio-a2a.md); the A1-only contract below is historical and
-applies to usage without `arm_receive`.
+in [A2a](esp32c6-sdio-a2a.md) and the
+[bidirectional/IRQ/async extension](esp32c6-sdio-bidirectional.md).
+The A1-only contract below is historical and applies without arming either DMA direction.
 
 ## Goals
 
@@ -120,8 +121,8 @@ and drain its engine before both operations.
 ### Invariants
 
 1. `new` does not route pads and does not write `HINF`/`SLC`/`SLCHOST`.
-2. In A1-only usage, no code path sets `IOREADY1/2`, writes `*_LINK`, `*_LINK_ADDR` or
-   `*SHAREMEM*`, or touches an interrupt enable.
+2. In A1-only usage, no code path sets `IOREADY1/2`, starts a DMA link, or writes
+   `*SHAREMEM*`. Shutdown masks SLC0 DMA notifications even if no packet was armed.
 3. `snapshot()` is always valid: the clock guard lives as long as the value.
    Diagnostics never clear or acknowledge anything. The snapshot also reads
    `HINF_CFG_DATA7` (function-0 ready, clock and capability bits).
@@ -194,14 +195,14 @@ The firmwares and the operator recipe for this qualification are described in
 5. `disable_bus` and `Drop`: pads on plain GPIO with input and output disabled (pulls unchanged), `IOREADY1/2` still 0,
    repeated `enable_bus`/`disable_bus` cycles.
 
-## Remaining A2–A4 work
+## A2–A4 software scope and later extensions
 
-- A2: A2a covers one host-to-slave packet; A2b slave-to-host DMA, queue
-  lifetime and cancellation, with zero C dependencies.
-- A3: SLC0/SLC1 interrupt dispatch, wake-up of async tasks, DAT1 notification,
-  full/empty and error handling.
-- A4: async RX/TX API, bounded queues, restart behavior, data integrity tests,
-  and actual P4 Host ↔ C6 Slave SDIO HIL tests.
+- Implemented in software: one packet in either direction, explicit buffer
+  restitution/rearming, SLC0 completion IRQ, DMA fault handling, async waits,
+  notification cancellation, and build-only P4/C6 QA examples.
+- Not hardware-qualified: the A2a ownership corrections and all later paths.
+- Later extensions: descriptor queues, SLC1/function 2 scheduling, host DAT1
+  notification handling, simultaneous RX/TX, and sustained throughput tests.
 
 ## Hardware acceptance (not performed)
 

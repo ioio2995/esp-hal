@@ -206,6 +206,65 @@ pub(super) const fn token_no_replace(bits: u32) -> u32 {
     bits | 1
 }
 
+/// A refused transmit arm. The original allocations remain exclusively owned.
+pub type ArmTransmitError = ArmReceiveError;
+
+/// Owns a single outbound packet until EOF and DMA quiescence are confirmed.
+pub(super) struct Transmit {
+    storage: Receive,
+    length: usize,
+}
+
+impl Transmit {
+    pub(super) fn descriptor_word(&self) -> u32 {
+        self.storage.descriptor_word()
+    }
+
+    pub(super) fn new(
+        descriptor: &'static mut Descriptor,
+        buffer: &'static mut [u32],
+        length: usize,
+    ) -> Result<Self, ArmTransmitError> {
+        if length == 0 || length > buffer.len().saturating_mul(4) || length > 0x3ffc {
+            return Err(ArmReceiveError::new(
+                Error::InvalidBuffer,
+                descriptor,
+                buffer,
+            ));
+        }
+        let storage = Receive::new(descriptor, buffer)?;
+        // SAFETY: storage owns both allocations and DMA has not started.
+        unsafe {
+            ptr::write_volatile(
+                ptr::addr_of_mut!((*storage.descriptor.as_ptr()).dw0).cast::<u32>(),
+                (1 << 31) | (1 << 30) | ((length as u32) << 14) | storage.capacity as u32,
+            );
+        }
+        Ok(Self { storage, length })
+    }
+
+    pub(super) fn descriptor_address(&self) -> u32 {
+        self.storage.descriptor_address()
+    }
+
+    /// # Safety
+    /// Successful RX EOF, parked DMA and the acquire barrier must precede this call.
+    pub(super) unsafe fn finish(&mut self) -> Result<usize, Error> {
+        if ((self.storage.descriptor_word() >> 14) & 0x3fff) as usize != self.length {
+            return Err(Error::InvalidDescriptor);
+        }
+        // SAFETY: the caller establishes the same quiescence as Receive::finish.
+        unsafe { self.storage.finish() }
+    }
+
+    /// # Safety
+    /// DMA must be stopped and its accesses ordered before restitution.
+    pub(super) unsafe fn into_buffers(self) -> (&'static mut Descriptor, &'static mut [u32]) {
+        // SAFETY: inherited from the caller.
+        unsafe { self.storage.into_buffers() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +368,69 @@ mod tests {
             assert!(buffer.iter().all(|word| *word == 0x11223344));
             unsafe {
                 assert_eq!(*descriptor.dw0.get(), 0);
+                drop(Box::from_raw(descriptor));
+                drop(Box::from_raw(buffer));
+            }
+        }
+    }
+
+    #[test]
+    fn transmit_descriptor_sets_eof_length_and_preserves_word_aligned_capacity() {
+        for length in [1usize, 63, 64, 65, 0x3ffc] {
+            let descriptor = Box::leak(Box::new(Descriptor::new()));
+            let buffer = vec![0x43424140u32; length.div_ceil(4)].leak();
+            let capacity = buffer.len() * 4;
+            let mut tx = Transmit::new(descriptor, buffer, length).unwrap();
+            assert_eq!(
+                tx.storage.descriptor_word(),
+                (1 << 31) | (1 << 30) | ((length as u32) << 14) | capacity as u32
+            );
+            // Emulate DMA owner write-back after EOF and PARK.
+            write_back(
+                &tx.storage,
+                (1 << 30) | ((length as u32) << 14) | capacity as u32,
+            );
+            assert_eq!(unsafe { tx.finish() }, Ok(length));
+            let (descriptor, buffer) = unsafe { tx.into_buffers() };
+            assert!(buffer.iter().all(|word| *word == 0x43424140));
+            unsafe {
+                drop(Box::from_raw(descriptor));
+                drop(Box::from_raw(buffer));
+            }
+        }
+    }
+
+    #[test]
+    fn transmit_rejects_changed_length_and_dma_owned_or_missing_eof() {
+        for word in [
+            (1 << 31) | (1 << 30) | (64 << 14) | 64,
+            (64 << 14) | 64,
+            (1 << 30) | (63 << 14) | 64,
+            (1 << 30) | (64 << 14) | 60,
+        ] {
+            let mut tx = Transmit::new(
+                Box::leak(Box::new(Descriptor::new())),
+                Box::leak(Box::new([0u32; 16])),
+                64,
+            )
+            .unwrap();
+            write_back(&tx.storage, word);
+            assert_eq!(unsafe { tx.finish() }, Err(Error::InvalidDescriptor));
+            free(tx.storage);
+        }
+    }
+
+    #[test]
+    fn invalid_transmit_length_returns_storage_without_descriptor_or_payload_changes() {
+        for length in [0, 65, usize::MAX] {
+            let descriptor = Box::leak(Box::new(Descriptor::new()));
+            let buffer = Box::leak(Box::new([0xdeadbeefu32; 16]));
+            let error = Transmit::new(descriptor, buffer, length).err().unwrap();
+            let (error, descriptor, buffer) = error.into_parts();
+            assert_eq!(error, Error::InvalidBuffer);
+            assert_eq!(unsafe { *descriptor.dw0.get() }, 0);
+            assert_eq!(buffer, &[0xdeadbeef; 16]);
+            unsafe {
                 drop(Box::from_raw(descriptor));
                 drop(Box::from_raw(buffer));
             }

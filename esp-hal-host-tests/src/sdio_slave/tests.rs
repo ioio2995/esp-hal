@@ -1,11 +1,14 @@
 use super::state::*;
 
-const STATES: [State; 5] = [
+const STATES: [State; 8] = [
     State::ControllerReady,
     State::BusExposed,
     State::Function1Receiving,
     State::Function1Received,
     State::Function1ReceiveError,
+    State::Function1Transmitting,
+    State::Function1Transmitted,
+    State::Function1TransmitError,
 ];
 
 #[test]
@@ -13,7 +16,7 @@ fn function_ready_is_only_allowed_with_a_receive_dma() {
     for s in STATES {
         assert_eq!(
             s.function_ready_allowed(),
-            s == State::Function1Receiving,
+            matches!(s, State::Function1Receiving | State::Function1Transmitting),
             "{s:?}"
         );
     }
@@ -36,9 +39,18 @@ fn transitions_are_limited_to_the_documented_graph() {
         (Function1Receiving, Function1Received),
         (Function1Receiving, Function1ReceiveError),
         (Function1Received, ControllerReady),
+        (Function1Received, BusExposed),
         (Function1Received, Function1ReceiveError),
         (Function1ReceiveError, ControllerReady),
         (Function1Receiving, ControllerReady),
+        (BusExposed, Function1Transmitting),
+        (Function1Transmitting, Function1Transmitted),
+        (Function1Transmitting, Function1TransmitError),
+        (Function1Transmitted, Function1TransmitError),
+        (Function1Transmitting, ControllerReady),
+        (Function1Transmitted, ControllerReady),
+        (Function1Transmitted, BusExposed),
+        (Function1TransmitError, ControllerReady),
     ];
     for from in STATES {
         for to in STATES {
@@ -70,7 +82,7 @@ fn only_the_receiving_state_can_yield_a_ready_function() {
             let st = function_state(enabled, s.function_ready_allowed());
             assert_eq!(
                 st == FunctionState::Ready,
-                enabled && s == State::Function1Receiving,
+                enabled && matches!(s, State::Function1Receiving | State::Function1Transmitting),
                 "{s:?} enabled={enabled}"
             );
         }

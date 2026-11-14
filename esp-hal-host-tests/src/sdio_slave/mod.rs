@@ -6,4 +6,8 @@ mod state;
 #[allow(dead_code, unexpected_cfgs)]
 mod receive;
 
+#[path = "../../../esp-hal/src/sdio_slave/events.rs"]
+#[allow(dead_code)]
+mod events;
+
 mod tests;

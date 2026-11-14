@@ -25,13 +25,18 @@ pub enum State {
     /// (A2a) The SLC0 receive DMA (host to slave) is armed with a linked list and
     /// a buffer, and the driver may declare function 1 ready. The pads are routed.
     ///
-    /// Only the host to slave direction exists in this state: there is no slave to
-    /// host DMA, no interrupt handling and no flow control.
+    /// The opposite direction cannot be armed until this packet is reclaimed.
     Function1Receiving,
     /// One packet completed. The receive buffer is owned by the CPU.
     Function1Received,
     /// A DMA error or stop timeout. Resources remain owned by the driver.
     Function1ReceiveError,
+    /// One slave-to-host packet is published and its DMA owns the storage.
+    Function1Transmitting,
+    /// The slave-to-host packet reached EOF and its DMA is parked.
+    Function1Transmitted,
+    /// An outbound DMA fault or stop timeout. Storage remains owned.
+    Function1TransmitError,
 }
 
 /// State of one SDIO I/O function, as observable on the bus.
@@ -45,7 +50,7 @@ pub enum FunctionState {
     EnabledByHost,
     /// The function is enabled and declared ready to transfer.
     ///
-    /// Function 1 can enter this state after a receive buffer is armed.
+    /// Function 1 can enter this state after either DMA direction is armed.
     Ready,
 }
 
@@ -62,9 +67,9 @@ pub enum Error {
     UnsupportedMemory,
     /// DMA write-back has an invalid owner, EOF, size, or length.
     InvalidDescriptor,
-    /// The receive DMA reported an overflow or a descriptor error.
+    /// DMA reported an overflow, underflow, or descriptor error.
     DmaFault,
-    /// The receive DMA did not become idle within the polling bound.
+    /// DMA did not become idle within the polling bound.
     DmaStopTimeout,
 }
 
@@ -79,9 +84,18 @@ impl State {
                 | (State::Function1Receiving, State::Function1Received)
                 | (State::Function1Receiving, State::Function1ReceiveError)
                 | (State::Function1Received, State::ControllerReady)
+                | (State::Function1Received, State::BusExposed)
                 | (State::Function1Received, State::Function1ReceiveError)
                 | (State::Function1ReceiveError, State::ControllerReady)
                 | (State::Function1Receiving, State::ControllerReady)
+                | (State::BusExposed, State::Function1Transmitting)
+                | (State::Function1Transmitting, State::Function1Transmitted)
+                | (State::Function1Transmitting, State::Function1TransmitError)
+                | (State::Function1Transmitted, State::Function1TransmitError)
+                | (State::Function1Transmitting, State::ControllerReady)
+                | (State::Function1Transmitted, State::ControllerReady)
+                | (State::Function1Transmitted, State::BusExposed)
+                | (State::Function1TransmitError, State::ControllerReady)
         )
     }
 
@@ -91,10 +105,12 @@ impl State {
     }
 
     /// Whether the driver may declare a function ready (`IOREADY1`) in this
-    /// state. Advertising a function as ready needs DMA buffers, which only
-    /// [`State::Function1Receiving`] has.
+    /// state. Advertising readiness requires an armed DMA direction.
     pub const fn function_ready_allowed(self) -> bool {
-        matches!(self, State::Function1Receiving)
+        matches!(
+            self,
+            State::Function1Receiving | State::Function1Transmitting
+        )
     }
 }
 
@@ -125,7 +141,9 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::InvalidState => "operation is not allowed in this state",
-            Self::InvalidBuffer => "receive buffer must contain 1..=4095 words",
+            Self::InvalidBuffer => {
+                "buffer must contain 1..=4095 words and transmit length must fit"
+            }
             Self::UnsupportedMemory => "DMA storage must be in internal DRAM",
             Self::InvalidDescriptor => "invalid DMA descriptor write-back",
             Self::DmaFault => "DMA overflow or descriptor fault",

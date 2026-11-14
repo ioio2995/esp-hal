@@ -1,8 +1,13 @@
-//! # ESP32-C6 SDIO Slave: A1 enumeration and A2a host-to-slave reception
+//! # ESP32-C6 SDIO Slave: single-packet, bidirectional SLC0 transfers
 //!
 //! One descriptor receives one incremental-address packet on SLC0. The host
-//! writes CMD53 to `0x1F800 - length`, after function 1 is enabled and ready.
-//! Slave-to-host DMA, interrupts, and automatic rearming are not implemented.
+//! reads or writes CMD53 at `0x1F800 - length`, after function 1 is enabled and
+//! ready. One direction is armed at a time. Explicit rearming is supported;
+//! descriptor chains, SLC1 and automatic rearming are not implemented.
+//!
+//! Convert with [`SdioSlave::into_async`] for SLC0 IRQ completion waits. Dropping
+//! a wait masks notifications but retains the DMA-owned storage. Stop DMA with
+//! [`SdioSlave::disable_bus`] before reclaiming a cancelled transfer.
 //!
 //! [`SdioSlave::arm_receive`] consumes exclusive static storage in internal RAM.
 //! Only a validated EOF with a parked DMA makes [`SdioSlave::received`] available.
@@ -19,21 +24,29 @@
 //! The implementation uses HINF, SLC and SLCHOST (ESP32-C6 TRM chapter 34).
 //! A1 enumeration and an A2a 64-byte transfer were reported by the developer.
 //! Those results do not qualify later source changes. See
-//! `docs/esp32c6-sdio-a2a.md` for the current contract and limitations.
+//! `docs/esp32c6-sdio-bidirectional.md` for the current contract and limitations.
 
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::{
+    marker::PhantomData,
+    sync::atomic::{Ordering, compiler_fence},
+};
 
 use crate::{
+    Async,
+    Blocking,
+    DriverMode,
     gpio::{AlternateFunction, AnyPin, Pin},
     peripherals::{GPIO18, GPIO19, GPIO20, GPIO21, GPIO22, GPIO23, HINF, SLC, SLCHOST},
     system::{Peripheral, PeripheralGuard},
 };
 
+mod events;
 mod receive;
 mod state;
 
-use receive::Receive;
-pub use receive::{ArmReceiveError, Descriptor};
+use events::{Completion, DMA_EVENTS, RECEIVE_EVENTS, TRANSMIT_EVENTS, completion};
+pub use receive::{ArmReceiveError, ArmTransmitError, Descriptor};
+use receive::{Receive, Transmit};
 use state::wait_for_idle;
 pub use state::{Error, FunctionState, State};
 
@@ -90,6 +103,21 @@ pub struct ReceiveDiagnostics {
     pub parked: bool,
 }
 
+/// Raw outbound-path registers. These values do not validate a host payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[instability::unstable]
+pub struct TransmitDiagnostics {
+    /// Descriptor owner, EOF, length and capacity, read with a volatile access.
+    pub descriptor_dw0: u32,
+    /// Cumulative SLC0 length published to the host, modulo 20 bits.
+    pub published_length: u32,
+    /// SLC0 raw interrupt status, without acknowledging it.
+    pub interrupt_raw: u32,
+    /// Whether the slave-to-host linked-list FSM is parked.
+    pub parked: bool,
+}
+
 /// Raw diagnostic registers. The values are not proof of a successful
 /// enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,8 +135,8 @@ pub struct RegisterSnapshot {
     pub slc1_interrupt_raw: u32,
 }
 
-/// SDIO Slave controller, bring-up level.
-pub struct SdioSlave<'d> {
+/// SDIO Slave controller with exclusive ownership of one SLC0 packet.
+pub struct SdioSlave<'d, Dm: DriverMode = Blocking> {
     _hinf: HINF<'d>,
     _slc: SLC<'d>,
     _slchost: SLCHOST<'d>,
@@ -116,11 +144,14 @@ pub struct SdioSlave<'d> {
     state: State,
     receive: Option<Receive>,
     receive_error: Option<Error>,
+    transmit: Option<Transmit>,
+    transmit_error: Option<Error>,
+    mode: PhantomData<Dm>,
     // Dropped last: the clock must outlive every other resource.
     _clock: Option<PeripheralGuard>,
 }
 
-impl<'d> SdioSlave<'d> {
+impl<'d> SdioSlave<'d, Blocking> {
     /// Takes the controller and its pins. Enables the clock of the block.
     ///
     /// The first user of the clock also resets the block. No pad is routed and
@@ -143,7 +174,43 @@ impl<'d> SdioSlave<'d> {
             state: State::ControllerReady,
             receive: None,
             receive_error: None,
+            transmit: None,
+            transmit_error: None,
+            mode: PhantomData,
             _clock: Some(clock),
+        }
+    }
+
+    /// Binds the SLC0 handler for asynchronous completion waits.
+    /// SLC1 remains disabled. Existing DMA ownership is preserved.
+    #[instability::unstable]
+    pub fn into_async(self) -> SdioSlave<'d, Async> {
+        self.mask_dma_interrupts();
+        self._slc.disable_ch0_interrupt_on_all_cores();
+        self._slc.bind_ch0_interrupt(slc0_handler);
+        self.map_mode()
+    }
+}
+
+impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
+    fn map_mode<Other: DriverMode>(self) -> SdioSlave<'d, Other> {
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: every owned field moves exactly once. ManuallyDrop prevents
+        // the old driver from stopping DMA or releasing its clock and pads.
+        unsafe {
+            SdioSlave {
+                _hinf: core::ptr::read(&this._hinf),
+                _slc: core::ptr::read(&this._slc),
+                _slchost: core::ptr::read(&this._slchost),
+                pads: core::ptr::read(&this.pads),
+                state: this.state,
+                receive: core::ptr::read(&this.receive),
+                receive_error: this.receive_error,
+                transmit: core::ptr::read(&this.transmit),
+                transmit_error: this.transmit_error,
+                mode: PhantomData,
+                _clock: core::ptr::read(&this._clock),
+            }
         }
     }
 
@@ -199,8 +266,8 @@ impl<'d> SdioSlave<'d> {
     ///
     /// Returns [`Error::InvalidState`] unless the pads are routed ([`State::BusExposed`] or
     /// [`State::Function1Receiving`], [`State::Function1Received`], or
-    /// [`State::Function1ReceiveError`]). [`Error::DmaStopTimeout`] if DMA does not
-    /// become idle. Storage, pads, and the clock remain owned on timeout.
+    /// [`State::Function1ReceiveError`], or a transmit state). [`Error::DmaStopTimeout`] if DMA
+    /// does not become idle. Storage, pads, and the clock remain owned on timeout.
     pub fn disable_bus(&mut self) -> Result<(), Error> {
         let next = State::ControllerReady;
         if !self.state.can_transition_to(next) {
@@ -208,7 +275,9 @@ impl<'d> SdioSlave<'d> {
         }
 
         self.clear_function_ready();
+        self.mask_dma_interrupts();
         self.stop_receive_dma()?;
+        self.stop_transmit_dma()?;
         self.release_pads();
         self.state = next;
         Ok(())
@@ -281,7 +350,7 @@ impl<'d> SdioSlave<'d> {
                 buffer,
             ));
         }
-        if self.receive.is_some() {
+        if self.receive.is_some() || self.transmit.is_some() {
             return Err(ArmReceiveError::new(
                 Error::InvalidState,
                 descriptor,
@@ -333,8 +402,7 @@ impl<'d> SdioSlave<'d> {
         // Orders descriptor stores before link activation on the C6 AHB bus.
         dma_fence();
 
-        slc.slc0int_clr()
-            .write(|w| w.sdio_slc0_tx_suc_eof_int_clr().set_bit());
+        self.clear_dma_events(RECEIVE_EVENTS);
         slc.slc0tx_link_addr()
             .write(|w| unsafe { w.sdio_slc0_txlink_addr().bits(descriptor_address) });
         slc.slc0tx_link()
@@ -348,12 +416,12 @@ impl<'d> SdioSlave<'d> {
         Ok(())
     }
 
-    /// (A2a) Declares I/O function 1 ready (`IOREADY1`). Only possible once the receive DMA is
+    /// Declares I/O function 1 ready (`IOREADY1`) once either DMA direction is
     /// armed. The host sees it in CCCR `IOR1` once it has enabled the function (`IOE1`).
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidState`] unless the state is [`State::Function1Receiving`].
+    /// [`Error::InvalidState`] unless a receive or transmit is armed.
     pub fn set_function1_ready(&mut self) -> Result<(), Error> {
         if !self.state.function_ready_allowed() {
             return Err(Error::InvalidState);
@@ -385,19 +453,17 @@ impl<'d> SdioSlave<'d> {
         }
         let slc = SLC::regs();
         let raw = slc.slc0int_raw().read();
-        if raw.sdio_slc0_tx_dscr_err_int_raw().bit_is_set()
-            || raw.sdio_slc0_tx_ovf_int_raw().bit_is_set()
-        {
-            return self.receive_failed(Error::DmaFault);
-        }
-        if !raw.sdio_slc0_tx_suc_eof_int_raw().bit_is_set()
-            || !slc
-                .slc0tx_link()
+        match completion(
+            raw.bits(),
+            false,
+            slc.slc0tx_link()
                 .read()
                 .sdio_slc0_txlink_park()
-                .bit_is_set()
-        {
-            return Ok(None);
+                .bit_is_set(),
+        ) {
+            Completion::Fault => return self.receive_failed(Error::DmaFault),
+            Completion::Pending | Completion::Draining => return Ok(None),
+            Completion::Complete => {}
         }
         self.clear_function_ready();
         dma_fence();
@@ -411,6 +477,7 @@ impl<'d> SdioSlave<'d> {
         slc.slc0int_clr()
             .write(|w| w.sdio_slc0_tx_suc_eof_int_clr().set_bit());
         self.state = State::Function1Received;
+        self.mask_dma_interrupts();
         Ok(Some(length))
     }
 
@@ -447,8 +514,33 @@ impl<'d> SdioSlave<'d> {
             .map(|receive| unsafe { receive.into_buffers() }))
     }
 
+    /// Reclaims a completed receive without disconnecting the bus pads.
+    ///
+    /// Function readiness stays cleared until the next explicit arm. The
+    /// cumulative host credit is preserved. The returned storage can be reused
+    /// in either direction once its CPU references have ended.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidState`] before successful receive completion,
+    /// or [`Error::DmaStopTimeout`] if shutdown cannot be confirmed.
+    #[instability::unstable]
+    pub fn finish_receive(
+        &mut self,
+    ) -> Result<(&'static mut Descriptor, &'static mut [u32]), Error> {
+        if self.state != State::Function1Received {
+            return Err(Error::InvalidState);
+        }
+        self.mask_dma_interrupts();
+        self.stop_receive_dma()?;
+        let receive = self.receive.take().unwrap();
+        self.state = State::BusExposed;
+        // SAFETY: stop_receive_dma confirmed quiescence and ordered accesses.
+        Ok(unsafe { receive.into_buffers() })
+    }
+
     fn receive_failed(&mut self, error: Error) -> Result<Option<usize>, Error> {
         self.clear_function_ready();
+        self.mask_dma_interrupts();
         self.receive_error = Some(error);
         self.state = State::Function1ReceiveError;
         Err(error)
@@ -514,6 +606,234 @@ impl<'d> SdioSlave<'d> {
         Ok(())
     }
 
+    /// Arms one slave-to-host packet on SLC0, without automatic rearming.
+    ///
+    /// The buffer is word aligned; `length` can end within its last word.
+    /// The driver publishes the cumulative length before starting RXLINK.
+    /// Function 1 readiness is set separately with [`Self::set_function1_ready`].
+    ///
+    /// # Errors
+    /// Returns the unchanged storage on invalid state, length or memory range.
+    /// Both directions must have returned their previous storage before arming.
+    #[instability::unstable]
+    pub fn arm_transmit(
+        &mut self,
+        descriptor: &'static mut Descriptor,
+        buffer: &'static mut [u32],
+        length: usize,
+    ) -> Result<(), ArmTransmitError> {
+        let error =
+            if self.state != State::BusExposed || self.receive.is_some() || self.transmit.is_some()
+            {
+                Some(Error::InvalidState)
+            } else if buffer.is_empty()
+                || buffer.len() > 0x3ffc / 4
+                || length == 0
+                || length > buffer.len() * 4
+            {
+                Some(Error::InvalidBuffer)
+            } else if !crate::soc::is_slice_in_dram(buffer)
+                || !crate::soc::is_slice_in_dram(core::slice::from_ref(descriptor))
+            {
+                Some(Error::UnsupportedMemory)
+            } else {
+                None
+            };
+        if let Some(error) = error {
+            return Err(ArmTransmitError::new(error, descriptor, buffer));
+        }
+        let transmit = Transmit::new(descriptor, buffer, length)?;
+        let address = transmit.descriptor_address();
+        self.transmit = Some(transmit);
+        self.transmit_error = None;
+        let slc = SLC::regs();
+        slc.slcconf0().modify(|_, w| {
+            w.sdio_slc0_rx_no_restart_clr().set_bit();
+            w.sdio_slc0_rx_loop_test().clear_bit();
+            w.sdio_slc0_rx_auto_wrback().set_bit();
+            w.sdio_slc0_token_auto_clr().clear_bit()
+        });
+        slc.slc_rx_dscr_conf()
+            .modify(|r, w| unsafe { w.bits(receive::token_no_replace(r.bits())) });
+        slc.slcconf1().modify(|_, w| {
+            w.sdio_sdio_cmd_hold_en().clear_bit();
+            w.sdio_slc0_len_auto_clr().clear_bit();
+            w.sdio_slc0_tx_stitch_en().clear_bit();
+            w.sdio_slc0_rx_stitch_en().clear_bit()
+        });
+        slc.slcconf0().modify(|_, w| w.sdio_slc0_rx_rst().set_bit());
+        slc.slcconf0()
+            .modify(|_, w| w.sdio_slc0_rx_rst().clear_bit());
+        self.clear_dma_events(TRANSMIT_EVENTS);
+        dma_fence();
+        slc.slc0rx_link_addr()
+            .write(|w| unsafe { w.sdio_slc0_rxlink_addr().bits(address) });
+        // INC_MORE preserves the host's cumulative byte accounting across packets.
+        slc.slc0_len_conf().write(|w| unsafe {
+            w.sdio_slc0_len_wdata().bits(length as u32);
+            w.sdio_slc0_len_inc_more().set_bit()
+        });
+        dma_fence();
+        slc.slc0rx_link()
+            .modify(|_, w| w.sdio_slc0_rxlink_start().set_bit());
+        self.state = State::Function1Transmitting;
+        Ok(())
+    }
+
+    /// Polls the outbound packet for EOF, parked DMA and CPU descriptor ownership.
+    ///
+    /// Returns `Some(length)` once, then `None`. An error retains all storage.
+    /// DMA completion does not prove that host software validated the payload.
+    ///
+    /// # Errors
+    /// Reports DMA faults or invalid descriptor write-back. Disable the bus
+    /// before reclaiming storage after an error.
+    #[instability::unstable]
+    pub fn poll_transmitted(&mut self) -> Result<Option<usize>, Error> {
+        if let Some(error) = self.transmit_error {
+            return Err(error);
+        }
+        if self.state != State::Function1Transmitting {
+            return Ok(None);
+        }
+        let slc = SLC::regs();
+        let event = completion(
+            slc.slc0int_raw().read().bits(),
+            true,
+            slc.slc0rx_link()
+                .read()
+                .sdio_slc0_rxlink_park()
+                .bit_is_set(),
+        );
+        match event {
+            Completion::Pending | Completion::Draining => return Ok(None),
+            Completion::Fault => return self.transmit_failed(Error::DmaFault),
+            Completion::Complete => {}
+        }
+        self.clear_function_ready();
+        dma_fence();
+        // SAFETY: successful EOF, parked DMA and an acquire barrier precede access.
+        let result = unsafe { self.transmit.as_mut().unwrap().finish() };
+        let length = match result {
+            Ok(length) => length,
+            Err(error) => return self.transmit_failed(error),
+        };
+        self.clear_dma_events(TRANSMIT_EVENTS);
+        self.mask_dma_interrupts();
+        self.state = State::Function1Transmitted;
+        Ok(Some(length))
+    }
+
+    /// Returns outbound storage after a successful bus disable.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidState`] before DMA shutdown is confirmed.
+    #[instability::unstable]
+    pub fn take_transmit_buffers(
+        &mut self,
+    ) -> Result<Option<(&'static mut Descriptor, &'static mut [u32])>, Error> {
+        if self.state != State::ControllerReady {
+            return Err(Error::InvalidState);
+        }
+        // SAFETY: ControllerReady requires successful DMA shutdown.
+        Ok(self.transmit.take().map(|tx| unsafe { tx.into_buffers() }))
+    }
+
+    /// Reads outbound DMA status without acknowledging any event.
+    #[instability::unstable]
+    pub fn transmit_diagnostics(&self) -> TransmitDiagnostics {
+        let slc = SLC::regs();
+        TransmitDiagnostics {
+            descriptor_dw0: self
+                .transmit
+                .as_ref()
+                .map(Transmit::descriptor_word)
+                .unwrap_or(0),
+            published_length: slc.slc0_length().read().sdio_slc0_len().bits(),
+            interrupt_raw: slc.slc0int_raw().read().bits(),
+            parked: slc
+                .slc0rx_link()
+                .read()
+                .sdio_slc0_rxlink_park()
+                .bit_is_set(),
+        }
+    }
+
+    /// Reclaims a completed outbound packet while keeping the bus pads routed.
+    /// The cumulative published length remains unchanged for the next packet.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidState`] before successful transmit completion,
+    /// or [`Error::DmaStopTimeout`] if shutdown cannot be confirmed.
+    #[instability::unstable]
+    pub fn finish_transmit(
+        &mut self,
+    ) -> Result<(&'static mut Descriptor, &'static mut [u32]), Error> {
+        if self.state != State::Function1Transmitted {
+            return Err(Error::InvalidState);
+        }
+        self.mask_dma_interrupts();
+        self.stop_transmit_dma()?;
+        let transmit = self.transmit.take().unwrap();
+        self.state = State::BusExposed;
+        // SAFETY: stop_transmit_dma confirmed quiescence and ordered accesses.
+        Ok(unsafe { transmit.into_buffers() })
+    }
+
+    fn transmit_failed(&mut self, error: Error) -> Result<Option<usize>, Error> {
+        self.clear_function_ready();
+        self.mask_dma_interrupts();
+        self.transmit_error = Some(error);
+        self.state = State::Function1TransmitError;
+        Err(error)
+    }
+
+    fn stop_transmit_dma(&mut self) -> Result<(), Error> {
+        if self.transmit.is_none() {
+            return Ok(());
+        }
+        let slc = SLC::regs();
+        slc.slc0rx_link()
+            .modify(|_, w| w.sdio_slc0_rxlink_stop().set_bit());
+        dma_fence();
+        let parked = || {
+            let link = slc.slc0rx_link().read();
+            link.sdio_slc0_rxlink_park().bit_is_set()
+                && link.sdio_slc0_rxlink_start().bit_is_clear()
+                && link.sdio_slc0_rxlink_stop().bit_is_clear()
+        };
+        let mut idle = wait_for_idle(parked);
+        slc.slcconf0().modify(|_, w| w.sdio_slc0_rx_rst().set_bit());
+        dma_fence();
+        if !idle {
+            idle = wait_for_idle(parked);
+        }
+        if !idle {
+            self.transmit_error = Some(Error::DmaStopTimeout);
+            self.state = State::Function1TransmitError;
+            return Err(Error::DmaStopTimeout);
+        }
+        dma_fence();
+        slc.slcconf0()
+            .modify(|_, w| w.sdio_slc0_rx_rst().clear_bit());
+        self.clear_dma_events(TRANSMIT_EVENTS);
+        self.transmit_error = None;
+        Ok(())
+    }
+
+    fn mask_dma_interrupts(&self) {
+        SLC::regs()
+            .slc0int_ena()
+            .modify(|r, w| unsafe { w.bits(r.bits() & !DMA_EVENTS) });
+    }
+
+    fn clear_dma_events(&self, mask: u32) {
+        // Only documented SLC0 DMA W1C bits. Never acknowledge SLC1 or host vectors.
+        SLC::regs()
+            .slc0int_clr()
+            .write(|w| unsafe { w.bits(mask & DMA_EVENTS) });
+    }
+
     fn clear_function_ready(&self) {
         HINF::regs().cfg_data1().modify(|_, w| {
             w.sdio_ioready1().clear_bit();
@@ -528,11 +848,125 @@ impl<'d> SdioSlave<'d> {
     }
 }
 
-impl Drop for SdioSlave<'_> {
+impl<'d> SdioSlave<'d, Async> {
+    /// Removes the asynchronous IRQ handler and returns blocking operation.
+    /// An active transfer remains owned and can be polled or stopped.
+    #[instability::unstable]
+    pub fn into_blocking(self) -> SdioSlave<'d, Blocking> {
+        self.mask_dma_interrupts();
+        self._slc.disable_ch0_interrupt_on_all_cores();
+        self.map_mode()
+    }
+
+    /// Waits for an armed host-to-slave packet using SLC0 interrupts.
+    ///
+    /// Dropping this future masks notification. It does not stop DMA or return
+    /// storage. Resume the wait, poll completion, or call [`Self::disable_bus`].
+    /// This permits cancellation with Embassy without returning DMA-owned RAM.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidState`] unless a receive is active, or a DMA error.
+    #[instability::unstable]
+    pub async fn wait_received(&mut self) -> Result<usize, Error> {
+        let mut source = CompletionWait {
+            driver: self,
+            transmitting: false,
+        };
+        events::Wait::new(&mut source).await
+    }
+
+    /// Waits for an armed slave-to-host packet using SLC0 interrupts.
+    ///
+    /// Cancellation masks notification and retains the active transfer and its
+    /// storage. Use [`Self::disable_bus`] for explicit cancellation of DMA.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidState`] unless a transmit is active, or a DMA error.
+    #[instability::unstable]
+    pub async fn wait_transmitted(&mut self) -> Result<usize, Error> {
+        let mut source = CompletionWait {
+            driver: self,
+            transmitting: true,
+        };
+        events::Wait::new(&mut source).await
+    }
+}
+
+static COMPLETION_WAKER: crate::asynch::AtomicWaker = crate::asynch::AtomicWaker::new();
+
+#[crate::handler]
+fn slc0_handler() {
+    // Preserve RAW until the task validates DMA and descriptor state. Masking
+    // stops a level IRQ from repeating while PARK has not caught up with EOF.
+    SLC::regs()
+        .slc0int_ena()
+        .modify(|r, w| unsafe { w.bits(r.bits() & !DMA_EVENTS) });
+    COMPLETION_WAKER.wake();
+}
+
+struct CompletionWait<'a, 'd> {
+    driver: &'a mut SdioSlave<'d, Async>,
+    transmitting: bool,
+}
+
+impl events::CompletionSource for CompletionWait<'_, '_> {
+    fn register(&self, waker: &core::task::Waker) {
+        COMPLETION_WAKER.register(waker);
+    }
+
+    fn poll_completion(&mut self) -> Result<Option<usize>, Error> {
+        let expected = if self.transmitting {
+            State::Function1Transmitting
+        } else {
+            State::Function1Receiving
+        };
+        let result = if self.transmitting {
+            self.driver.poll_transmitted()
+        } else {
+            self.driver.poll_received()
+        };
+        match result {
+            Ok(None) if self.driver.state != expected => Err(Error::InvalidState),
+            result => result,
+        }
+    }
+
+    fn pending_event(&self) -> bool {
+        let mask = if self.transmitting {
+            TRANSMIT_EVENTS
+        } else {
+            RECEIVE_EVENTS
+        };
+        SLC::regs().slc0int_raw().read().bits() & mask != 0
+    }
+
+    fn arm_notification(&self) {
+        let mask = if self.transmitting {
+            TRANSMIT_EVENTS
+        } else {
+            RECEIVE_EVENTS
+        };
+        SLC::regs()
+            .slc0int_ena()
+            .modify(|r, w| unsafe { w.bits(r.bits() | mask) });
+    }
+
+    fn mask_notification(&self) {
+        self.driver.mask_dma_interrupts();
+    }
+}
+
+impl<Dm: DriverMode> Drop for SdioSlave<'_, Dm> {
     fn drop(&mut self) {
+        self.mask_dma_interrupts();
+        self._slc.disable_ch0_interrupt_on_all_cores();
         if self.state.pads_routed() {
             self.clear_function_ready();
-            if self.stop_receive_dma().is_err() {
+            if self
+                .stop_receive_dma()
+                .and_then(|_| self.stop_transmit_dma())
+                .is_err()
+            {
                 // Reset stays asserted. Leaking one clock reference and static
                 // storage is safer than permitting DMA to access reused memory.
                 if let Some(clock) = self._clock.take() {
@@ -556,17 +990,18 @@ fn dma_fence() {
     compiler_fence(Ordering::SeqCst);
 }
 
-impl core::fmt::Debug for SdioSlave<'_> {
+impl<Dm: DriverMode> core::fmt::Debug for SdioSlave<'_, Dm> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SdioSlave")
             .field("state", &self.state)
             .field("receive_error", &self.receive_error)
+            .field("transmit_error", &self.transmit_error)
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(feature = "defmt")]
-impl defmt::Format for SdioSlave<'_> {
+impl<Dm: DriverMode> defmt::Format for SdioSlave<'_, Dm> {
     fn format(&self, f: defmt::Formatter<'_>) {
         defmt::write!(
             f,
