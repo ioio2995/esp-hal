@@ -14,7 +14,8 @@
 //! With `SDIO_A2=0` (default), only CMD52 *reads* are issued. The firmware never writes a CCCR
 //! register, never changes the bus width or the clock, never negotiates high speed or UHS, never
 //! enables a function and issues no CMD53. With `SDIO_A2=1`, it enables function 1 and writes one
-//! 64-byte packet. It does not modify the host driver.
+//! 64-byte packet. `SDIO_A2=2` instead reads and validates one C6 packet.
+//! Both modes use the existing host driver.
 //!
 //! The firmware reports host-side results only. It never prints a global qualification verdict:
 //! that needs the C6 console log (`sdio-a1-c6-slave`) as well. A line says `PASS` only for a step
@@ -88,6 +89,8 @@ use qa_test::sdio_a1::{
     R4Class,
     R4Info,
     R6Info,
+    a2b_packet_matches,
+    available_packet_bytes,
     cmd53_arg,
     fbr_base,
     parse_u32,
@@ -112,7 +115,8 @@ const CMD5_TRIES: u32 = parse_u32(option_env!("SDIO_A1_CMD5_TRIES"), 10);
 const CMD5_RETRY_MS: u32 = parse_u32(option_env!("SDIO_A1_CMD5_RETRY_MS"), 200);
 const ROUNDS: u32 = parse_u32(option_env!("SDIO_A1_ROUNDS"), 1);
 /// Build-time switch `SDIO_A2=1`: after the A1 enumeration, enable function 1 and write one packet
-/// with CMD53 (A2a). With it, this firmware is no longer "writes=none".
+/// with CMD53 (A2a). `SDIO_A2=2` instead reads the 64-byte A2b packet.
+/// Both transfer modes write CCCR IOE1.
 const A2: u32 = parse_u32(option_env!("SDIO_A2"), 0);
 const ROUND_GAP_MS: u32 = parse_u32(option_env!("SDIO_A1_ROUND_GAP_MS"), 500);
 const CLOCK_HZ: u32 = parse_u32(option_env!("SDIO_A1_CLOCK_HZ"), 400_000);
@@ -304,6 +308,10 @@ fn h6_function1(slot: &mut HostSlot<'_>, delay: &Delay, tally: &mut HostTally) {
             return;
         }
     }
+    if A2 == 2 {
+        h6_receive_packet(slot, delay, tally);
+        return;
+    }
     match read_fn1_u32(slot, 0x44) {
         Ok(token) if (token >> 16) & 0xfff != 0 => a1!(
             tally,
@@ -390,6 +398,72 @@ fn h6_function1(slot: &mut HostSlot<'_>, delay: &Delay, tally: &mut HostTally) {
             v
         ),
         Err(e) => a1!(tally, "A2_INT_ST", Outcome::Fail, "{}", describe(e)),
+    }
+}
+
+/// A2b starts after a full C6 reset: this host has consumed zero published bytes.
+/// A fresh-session baseline is essential; PKT_LEN is cumulative, not a FIFO size.
+fn h6_receive_packet(slot: &mut HostSlot<'_>, delay: &Delay, tally: &mut HostTally) {
+    let mut available = 0;
+    for _ in 0..40 {
+        match read_fn1_u32(slot, 0x60) {
+            Ok(published) => available = available_packet_bytes(published, 0),
+            Err(error) => {
+                a1!(tally, "A2B_PKT_LEN", Outcome::Fail, "{}", describe(error));
+                return;
+            }
+        }
+        if available != 0 {
+            break;
+        }
+        delay.delay_millis(50);
+    }
+    if available != 64 {
+        a1!(
+            tally,
+            "A2B_PKT_LEN",
+            Outcome::Fail,
+            "expected=64 available={}",
+            available
+        );
+        return;
+    }
+    a1!(
+        tally,
+        "A2B_PKT_LEN",
+        Outcome::Pass,
+        "available=64 consumed=0"
+    );
+    let mut buffer = Dma64([0; 64]);
+    let arg = cmd53_arg(false, 1, false, true, 0x1_f800 - 64, 64);
+    let dma = match DmaAlignedMut::new(&mut buffer.0) {
+        Ok(dma) => dma.unsize(),
+        Err(_) => {
+            a1!(tally, "A2B_CMD53_READ", Outcome::Fail, "unaligned buffer");
+            return;
+        }
+    };
+    match slot.read_blocks_blocking(53, arg, dma, 64, 1) {
+        Ok(words) => {
+            let flags = ((words[0] >> 8) & 0xff) as u8;
+            let valid = flags & sdio::SdioError::ALL == 0 && a2b_packet_matches(&buffer.0);
+            a1!(
+                tally,
+                "A2B_CMD53_READ",
+                if valid { Outcome::Pass } else { Outcome::Fail },
+                "length=64 r5_flags={:#04x} payload_match={} consumed={}",
+                flags,
+                a2b_packet_matches(&buffer.0),
+                if valid { 64 } else { 0 }
+            );
+        }
+        Err(error) => a1!(
+            tally,
+            "A2B_CMD53_READ",
+            Outcome::Fail,
+            "error={} consumed=0; no retry",
+            error_name(&error)
+        ),
     }
 }
 
@@ -978,10 +1052,16 @@ fn main() -> ! {
          writes={}",
         RUN_ID,
         GIT_SHA,
-        if A2 == 0 { "A1" } else { "A2a" },
+        match A2 {
+            0 => "A1",
+            2 => "A2b",
+            _ => "A2a",
+        },
         CLOCK_HZ,
         if A2 == 0 {
             "none"
+        } else if A2 == 2 {
+            "CCCR_IOE1;CMD53_read_64_bytes"
         } else {
             "CCCR_IOE1,CMD53_64_bytes"
         }

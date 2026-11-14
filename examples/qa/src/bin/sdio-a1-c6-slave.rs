@@ -103,11 +103,15 @@ fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     let delay = Delay::new();
 
-    // Console: set UART0 up through the esp-hal driver (needed behind the factory ESP-IDF bootloader on the P4, see
-    // sdio-a1-p4-host). TX = GPIO16, the pin wired to the H7 console header. Does not touch the SDIO pads GPIO18..23.
-    let _console = Uart::new(peripherals.UART0, UartConfig::default().with_baudrate(115_200))
-        .ok()
-        .map(|uart| uart.with_tx(peripherals.GPIO16));
+    // Console: set UART0 up through the esp-hal driver (needed behind the factory ESP-IDF
+    // bootloader on the P4, see sdio-a1-p4-host). TX = GPIO16, the pin wired to the H7 console
+    // header. Does not touch the SDIO pads GPIO18..23.
+    let _console = Uart::new(
+        peripherals.UART0,
+        UartConfig::default().with_baudrate(115_200),
+    )
+    .ok()
+    .map(|uart| uart.with_tx(peripherals.GPIO16));
 
     a1!(
         "BOOT",
@@ -133,7 +137,11 @@ fn main() -> ! {
     let state = slave.state();
     a1!(
         "DRIVER_NEW",
-        if state == State::ControllerReady { Outcome::Pass } else { Outcome::Fail },
+        if state == State::ControllerReady {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
         "state={:?}",
         state
     );
@@ -154,7 +162,11 @@ fn main() -> ! {
     let state = slave.state();
     a1!(
         "STATE",
-        if state == State::BusExposed { Outcome::Pass } else { Outcome::Fail },
+        if state == State::BusExposed {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
         "state={:?} expected={:?}",
         state,
         State::BusExposed
@@ -218,7 +230,13 @@ fn main() -> ! {
         if since_alive >= ALIVE_MS {
             since_alive = 0;
             ticks = ticks.wrapping_add(1);
-            a1!("ALIVE", Outcome::Info, "tick={} state={:?}", ticks, slave.state());
+            a1!(
+                "ALIVE",
+                Outcome::Info,
+                "tick={} state={:?}",
+                ticks,
+                slave.state()
+            );
         }
     }
 }

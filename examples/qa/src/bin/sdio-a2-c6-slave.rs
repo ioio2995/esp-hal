@@ -26,7 +26,7 @@ use esp_hal::{
     uart::{Config as UartConfig, Uart},
 };
 use esp_println::println;
-use qa_test::sdio_a1::a2a_packet_matches;
+use qa_test::sdio_a1::{a2a_packet_matches, parse_u32};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -38,6 +38,9 @@ const RUN_ID: &str = match option_env!("SDIO_A1_RUN_ID") {
     Some(id) => id,
     None => "unknown",
 };
+
+/// `SDIO_A2=2` sends a packet to P4; the default retains the A2a receive test.
+const TRANSMIT: bool = parse_u32(option_env!("SDIO_A2"), 1) == 2;
 
 static mut RX_DESCRIPTOR: Descriptor = Descriptor::new();
 /// 512 bytes, word aligned (an array of `u32`).
@@ -80,8 +83,9 @@ fn main() -> ! {
     a2!(
         "BOOT",
         "INFO",
-        "sha={} fw=sdio-a2-c6-slave scope=A2a dma=rx-only irq=off",
-        GIT_SHA
+        "sha={} fw=sdio-a2-c6-slave scope={} dma=single-packet irq=off",
+        GIT_SHA,
+        if TRANSMIT { "A2b" } else { "A2a" }
     );
 
     let mut slave = SdioSlave::new(
@@ -114,22 +118,43 @@ fn main() -> ! {
             &mut *addr_of_mut!(RX_BUFFER),
         )
     };
-    match slave.arm_receive(descriptor, buffer) {
+    if TRANSMIT {
+        for (i, word) in buffer.iter_mut().take(16).enumerate() {
+            let first = 0x40 + (i * 4) as u8;
+            *word = u32::from_le_bytes([first, first + 1, first + 2, first + 3]);
+        }
+    }
+    let armed = if TRANSMIT {
+        slave.arm_transmit(descriptor, buffer, 64)
+    } else {
+        slave.arm_receive(descriptor, buffer)
+    };
+    match armed {
         Ok(()) => {
-            let d = slave.receive_diagnostics();
-            a2!(
-                "ARM_RECEIVE",
-                "PASS",
-                "state={:?} descriptor_dw0={:#010x} token={} parked={} int_raw={:#010x}",
-                slave.state(),
-                d.descriptor_dw0,
-                d.token,
-                d.parked,
-                d.interrupt_raw
-            );
+            if TRANSMIT {
+                a2!(
+                    "ARM_TRANSMIT",
+                    "PASS",
+                    "state={:?} diagnostics={:?}",
+                    slave.state(),
+                    slave.transmit_diagnostics()
+                );
+            } else {
+                let d = slave.receive_diagnostics();
+                a2!(
+                    "ARM_RECEIVE",
+                    "PASS",
+                    "state={:?} descriptor_dw0={:#010x} token={} parked={} int_raw={:#010x}",
+                    slave.state(),
+                    d.descriptor_dw0,
+                    d.token,
+                    d.parked,
+                    d.interrupt_raw
+                );
+            }
         }
         Err(e) => {
-            a2!("ARM_RECEIVE", "FAIL", "error={:?}", e);
+            a2!("ARM", "FAIL", "error={:?}", e);
             loop {
                 delay.delay_millis(1000);
             }
@@ -159,46 +184,78 @@ fn main() -> ! {
         }
 
         if !received {
-            match slave.poll_received() {
-                Ok(Some(length)) => {
-                    received = true;
-                    let d = slave.receive_diagnostics();
-                    let bytes = slave.received().unwrap_or(&[]);
-                    a2!(
-                        "RX_PACKET",
-                        if a2a_packet_matches(bytes) {
-                            "PASS"
-                        } else {
-                            "FAIL"
-                        },
-                        "length={} descriptor_dw0={:#010x} int_raw={:#010x} data={}",
-                        length,
-                        d.descriptor_dw0,
-                        d.interrupt_raw,
-                        Hex(bytes)
-                    );
+            if TRANSMIT {
+                match slave.poll_transmitted() {
+                    Ok(Some(length)) => {
+                        received = true;
+                        a2!(
+                            "TX_PACKET",
+                            if length == 64 { "PASS" } else { "FAIL" },
+                            "length={} diagnostics={:?} DMA completion only; inspect P4 payload verdict",
+                            length,
+                            slave.transmit_diagnostics()
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        received = true;
+                        a2!("TX_PACKET", "FAIL", "error={:?}; no retry", error);
+                    }
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    received = true;
-                    a2!("RX_PACKET", "FAIL", "error={:?}; no retry", error);
+            } else {
+                match slave.poll_received() {
+                    Ok(Some(length)) => {
+                        received = true;
+                        let d = slave.receive_diagnostics();
+                        let bytes = slave.received().unwrap_or(&[]);
+                        a2!(
+                            "RX_PACKET",
+                            if a2a_packet_matches(bytes) {
+                                "PASS"
+                            } else {
+                                "FAIL"
+                            },
+                            "length={} descriptor_dw0={:#010x} int_raw={:#010x} data={}",
+                            length,
+                            d.descriptor_dw0,
+                            d.interrupt_raw,
+                            Hex(bytes)
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        received = true;
+                        a2!("RX_PACKET", "FAIL", "error={:?}; no retry", error);
+                    }
                 }
             }
         }
 
         if ticks % 100 == 0 {
-            let d = slave.receive_diagnostics();
-            a2!(
-                "ALIVE",
-                "INFO",
-                "tick={} function1={:?} received={} descriptor_dw0={:#010x} token={} int_raw={:#010x}",
-                ticks / 100,
-                slave.function1(),
-                received,
-                d.descriptor_dw0,
-                d.token,
-                d.interrupt_raw
-            );
+            if TRANSMIT {
+                a2!(
+                    "ALIVE",
+                    "INFO",
+                    "tick={} function1={:?} transmitted={} diagnostics={:?}",
+                    ticks / 100,
+                    slave.function1(),
+                    received,
+                    slave.transmit_diagnostics()
+                );
+            } else {
+                let d = slave.receive_diagnostics();
+                a2!(
+                    "ALIVE",
+                    "INFO",
+                    "tick={} function1={:?} received={} descriptor_dw0={:#010x} token={} int_raw={:#010x}",
+                    ticks / 100,
+                    slave.function1(),
+                    received,
+                    d.descriptor_dw0,
+                    d.token,
+                    d.interrupt_raw
+                );
+            }
         }
     }
 }

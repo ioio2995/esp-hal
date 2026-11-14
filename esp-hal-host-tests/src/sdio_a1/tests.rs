@@ -406,3 +406,19 @@ fn a2a_rejects_short_long_and_corrupted_packets() {
     bytes[31] ^= 1;
     assert!(!a2a_packet_matches(&bytes));
 }
+#[test]
+fn a2b_packet_counter_wrap_and_payload_are_checked() {
+    use super::proto::{a2b_packet_matches, available_packet_bytes};
+    assert_eq!(cmd53_arg(false, 1, false, true, 0x1f7c0, 64), 0x17ef8040);
+    assert_eq!(available_packet_bytes(64, 0), 64);
+    assert_eq!(available_packet_bytes(128, 64), 64);
+    assert_eq!(available_packet_bytes(32, 0x000f_ffe0), 64);
+    assert_eq!(available_packet_bytes(128, 128), 0);
+    // Function 2 occupies the other bits in PKT_LEN.
+    assert_eq!(available_packet_bytes(0xfff0_0040, 0), 64);
+    let mut bytes: Vec<u8> = (0x40..0x80).collect();
+    assert!(a2b_packet_matches(&bytes));
+    assert!(!a2b_packet_matches(&bytes[..63]));
+    bytes[63] ^= 1;
+    assert!(!a2b_packet_matches(&bytes));
+}
