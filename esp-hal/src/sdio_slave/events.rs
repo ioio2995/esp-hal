@@ -39,6 +39,7 @@ pub(super) trait CompletionSource {
     fn mask_notification(&self);
 }
 
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub(super) struct Wait<'a, S: CompletionSource> {
     source: &'a mut S,
     result: Option<Result<usize, super::state::Error>>,
