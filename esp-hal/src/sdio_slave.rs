@@ -38,17 +38,28 @@
 //!
 //! ```rust, no_run
 #![doc = crate::before_snippet!()]
-//! use esp_hal::sdio_slave::{Pins, SdioSlave};
-//! let pins = Pins::new(
-//!     peripherals.GPIO18.reborrow(), peripherals.GPIO19.reborrow(),
-//!     peripherals.GPIO20.reborrow(), peripherals.GPIO21.reborrow(),
-//!     peripherals.GPIO22.reborrow(), peripherals.GPIO23.reborrow(),
-//! );
+//! use esp_hal::sdio_slave::SdioSlave;
 //! let mut slave = SdioSlave::new(
 //!     peripherals.HINF.reborrow(), peripherals.SLC.reborrow(),
-//!     peripherals.SLCHOST.reborrow(), pins,
-//! );
+//!     peripherals.SLCHOST.reborrow(),
+//! )
+//! .with_cmd(peripherals.GPIO18.reborrow())
+//! .with_clk(peripherals.GPIO19.reborrow())
+//! .with_data0(peripherals.GPIO20.reborrow())
+//! .with_data1(peripherals.GPIO21.reborrow())
+//! .with_data2(peripherals.GPIO22.reborrow())
+//! .with_data3(peripherals.GPIO23.reborrow());
 //! slave.enable_bus()?;
+#![doc = crate::after_snippet!()]
+//! ```
+#![doc = "\n"]
+//! A different GPIO cannot be assigned to a native signal:
+//!
+//! ```compile_fail
+#![doc = crate::before_snippet!()]
+//! use esp_hal::sdio_slave::SdioSlave;
+//! let slave = SdioSlave::new(peripherals.HINF, peripherals.SLC, peripherals.SLCHOST);
+//! let slave = slave.with_cmd(peripherals.GPIO19);
 #![doc = crate::after_snippet!()]
 //! ```
 
@@ -75,47 +86,6 @@ pub use receive::{ArmReceiveError, ArmTransmitError, Descriptor};
 use receive::{Receive, Transmit};
 use state::wait_for_idle;
 pub use state::{Error, FunctionState, State};
-
-/// The six pads of the SDIO Slave bus.
-///
-/// They are fixed to GPIO18..GPIO23 by IO MUX function 0.
-/// The native bus owns all six pads together, so a partial bus cannot be exposed.
-#[non_exhaustive]
-pub struct Pins<'d> {
-    /// `SDIO_CMD`
-    pub cmd: GPIO18<'d>,
-    /// `SDIO_CLK`
-    pub clk: GPIO19<'d>,
-    /// `SDIO_DATA0`
-    pub data0: GPIO20<'d>,
-    /// `SDIO_DATA1`
-    pub data1: GPIO21<'d>,
-    /// `SDIO_DATA2`
-    pub data2: GPIO22<'d>,
-    /// `SDIO_DATA3`
-    pub data3: GPIO23<'d>,
-}
-
-impl<'d> Pins<'d> {
-    /// Groups the six SDIO pins.
-    pub fn new(
-        cmd: GPIO18<'d>,
-        clk: GPIO19<'d>,
-        data0: GPIO20<'d>,
-        data1: GPIO21<'d>,
-        data2: GPIO22<'d>,
-        data3: GPIO23<'d>,
-    ) -> Self {
-        Self {
-            cmd,
-            clk,
-            data0,
-            data1,
-            data2,
-            data3,
-        }
-    }
-}
 
 /// Raw view of the receive path, for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +138,7 @@ pub struct SdioSlave<'d, Dm: DriverMode = Blocking> {
     _hinf: HINF<'d>,
     _slc: SLC<'d>,
     _slchost: SLCHOST<'d>,
-    pads: [AnyPin<'d>; 6],
+    pads: [Option<AnyPin<'d>>; 6],
     state: State,
     receive: Option<Receive>,
     receive_error: Option<Error>,
@@ -180,25 +150,19 @@ pub struct SdioSlave<'d, Dm: DriverMode = Blocking> {
 }
 
 impl<'d> SdioSlave<'d, Blocking> {
-    /// Takes the controller and its pins. Enables the clock of the block.
+    /// Creates a new SDIO slave controller in Blocking mode.
     ///
-    /// The first user of the clock also resets the block. No pad is routed and
-    /// no function register is written.
-    pub fn new(hinf: HINF<'d>, slc: SLC<'d>, slchost: SLCHOST<'d>, pins: Pins<'d>) -> Self {
+    /// Enables the block clock. The first clock user also resets the block.
+    /// No pad is configured or routed. All six native pads must be supplied
+    /// through the `with_*` methods before calling [`Self::enable_bus`].
+    pub fn new(hinf: HINF<'d>, slc: SLC<'d>, slchost: SLCHOST<'d>) -> Self {
         let clock = PeripheralGuard::new(Peripheral::SdioSlave);
 
         Self {
             _hinf: hinf,
             _slc: slc,
             _slchost: slchost,
-            pads: [
-                pins.cmd.degrade(),
-                pins.clk.degrade(),
-                pins.data0.degrade(),
-                pins.data1.degrade(),
-                pins.data2.degrade(),
-                pins.data3.degrade(),
-            ],
+            pads: [None, None, None, None, None, None],
             state: State::ControllerReady,
             receive: None,
             receive_error: None,
@@ -221,6 +185,86 @@ impl<'d> SdioSlave<'d, Blocking> {
 }
 
 impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
+    /// Assigns GPIO18 to the SDIO command signal.
+    ///
+    /// The native IO MUX connection requires this fixed GPIO. The pad is
+    /// configured only when [`Self::enable_bus`] succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the controller is in [`State::ControllerReady`].
+    pub fn with_cmd(self, pin: GPIO18<'d>) -> Self {
+        self.with_pad(0, pin.degrade())
+    }
+
+    /// Assigns GPIO19 to the SDIO clock signal.
+    ///
+    /// The native IO MUX connection requires this fixed GPIO. The pad is
+    /// configured only when [`Self::enable_bus`] succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the controller is in [`State::ControllerReady`].
+    pub fn with_clk(self, pin: GPIO19<'d>) -> Self {
+        self.with_pad(1, pin.degrade())
+    }
+
+    /// Assigns GPIO20 to the SDIO data 0 signal.
+    ///
+    /// The native IO MUX connection requires this fixed GPIO. The pad is
+    /// configured only when [`Self::enable_bus`] succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the controller is in [`State::ControllerReady`].
+    pub fn with_data0(self, pin: GPIO20<'d>) -> Self {
+        self.with_pad(2, pin.degrade())
+    }
+
+    /// Assigns GPIO21 to the SDIO data 1 signal.
+    ///
+    /// The native IO MUX connection requires this fixed GPIO. The pad is
+    /// configured only when [`Self::enable_bus`] succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the controller is in [`State::ControllerReady`].
+    pub fn with_data1(self, pin: GPIO21<'d>) -> Self {
+        self.with_pad(3, pin.degrade())
+    }
+
+    /// Assigns GPIO22 to the SDIO data 2 signal.
+    ///
+    /// The native IO MUX connection requires this fixed GPIO. The pad is
+    /// configured only when [`Self::enable_bus`] succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the controller is in [`State::ControllerReady`].
+    pub fn with_data2(self, pin: GPIO22<'d>) -> Self {
+        self.with_pad(4, pin.degrade())
+    }
+
+    /// Assigns GPIO23 to the SDIO data 3 signal.
+    ///
+    /// The native IO MUX connection requires this fixed GPIO. The pad is
+    /// configured only when [`Self::enable_bus`] succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the controller is in [`State::ControllerReady`].
+    pub fn with_data3(self, pin: GPIO23<'d>) -> Self {
+        self.with_pad(5, pin.degrade())
+    }
+
+    fn with_pad(mut self, index: usize, pad: AnyPin<'d>) -> Self {
+        // Replacing a routed pad could interrupt a transfer and release a pin
+        // still used by the peripheral. Configuration is restricted to idle.
+        assert!(self.state == State::ControllerReady);
+        self.pads[index] = Some(pad);
+        self
+    }
+
     fn map_mode<Other: DriverMode>(self) -> SdioSlave<'d, Other> {
         let this = core::mem::ManuallyDrop::new(self);
         // SAFETY: every owned field moves exactly once. ManuallyDrop prevents
@@ -264,18 +308,15 @@ impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
     /// Returns [`Error::InvalidState`] unless the state is
     /// [`State::ControllerReady`]. Returns [`Error::SessionInvalidated`] after
     /// an interrupted packet; this instance cannot resume the previous session.
+    /// Returns [`Error::MissingPins`] if any of the six native pads is missing.
+    /// No register or pad is changed when configuration is incomplete.
     pub fn enable_bus(&mut self) -> Result<(), Error> {
-        if self.state == State::SessionInvalidated {
-            return Err(Error::SessionInvalidated);
-        }
+        state::validate_bus_configuration(self.state, &self.pads)?;
         let next = State::BusExposed;
-        if !self.state.can_transition_to(next) {
-            return Err(Error::InvalidState);
-        }
 
         self.clear_function_ready();
 
-        for pad in &self.pads {
+        for pad in self.pads.iter().flatten() {
             // Known starting point: no output forced by the GPIO matrix, hold
             // released. Then hand the pad over to the controller.
             pad.init_gpio();
@@ -883,7 +924,7 @@ impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
     }
 
     fn release_pads(&self) {
-        for pad in &self.pads {
+        for pad in self.pads.iter().flatten() {
             pad.init_gpio();
         }
     }

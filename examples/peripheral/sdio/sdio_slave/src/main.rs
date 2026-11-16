@@ -11,7 +11,7 @@ use embassy_time::{Duration, Timer, with_timeout};
 use esp_backtrace as _;
 use esp_hal::{
     Async,
-    sdio_slave::{Descriptor, FunctionState, Pins, SdioSlave},
+    sdio_slave::{Descriptor, FunctionState, SdioSlave},
     timer::timg::TimerGroup,
     uart::{Config as UartConfig, Uart},
 };
@@ -94,20 +94,14 @@ async fn main(_spawner: Spawner) {
     )
     .unwrap()
     .with_tx(peripherals.GPIO16);
-    let mut slave = SdioSlave::new(
-        peripherals.HINF,
-        peripherals.SLC,
-        peripherals.SLCHOST,
-        Pins::new(
-            peripherals.GPIO18,
-            peripherals.GPIO19,
-            peripherals.GPIO20,
-            peripherals.GPIO21,
-            peripherals.GPIO22,
-            peripherals.GPIO23,
-        ),
-    )
-    .into_async();
+    let mut slave = SdioSlave::new(peripherals.HINF, peripherals.SLC, peripherals.SLCHOST)
+        .into_async()
+        .with_cmd(peripherals.GPIO18)
+        .with_clk(peripherals.GPIO19)
+        .with_data0(peripherals.GPIO20)
+        .with_data1(peripherals.GPIO21)
+        .with_data2(peripherals.GPIO22)
+        .with_data3(peripherals.GPIO23);
     println!("C6 SDIO echo ready to arm");
     if let Err(error) = exchange(&mut slave).await {
         println!("SDIO exchange failed: {}", error);

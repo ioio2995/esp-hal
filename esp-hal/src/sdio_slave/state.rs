@@ -65,6 +65,8 @@ pub enum FunctionState {
 pub enum Error {
     /// The operation is not allowed in the current [`State`].
     InvalidState,
+    /// One or more native SDIO pads have not been assigned.
+    MissingPins,
     /// An interrupted transfer requires a new controller/host session.
     SessionInvalidated,
     /// A DMA buffer is empty or larger than 16380 bytes.
@@ -136,6 +138,23 @@ impl State {
     }
 }
 
+/// Checks the complete bus configuration before any register or pad access.
+pub(super) fn validate_bus_configuration<P>(
+    state: State,
+    pads: &[Option<P>; 6],
+) -> Result<(), Error> {
+    if state == State::SessionInvalidated {
+        return Err(Error::SessionInvalidated);
+    }
+    if state != State::ControllerReady {
+        return Err(Error::InvalidState);
+    }
+    if pads.iter().any(Option::is_none) {
+        return Err(Error::MissingPins);
+    }
+    Ok(())
+}
+
 /// Derives the observable state of a function from the two hardware bits.
 ///
 /// `ready` without `enabled` is reported as [`FunctionState::Disabled`]: a
@@ -163,6 +182,7 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::InvalidState => "operation is not allowed in this state",
+            Self::MissingPins => "all six native SDIO pads must be assigned",
             Self::SessionInvalidated => {
                 "transfer interrupted; create a new session and resynchronize the host"
             }

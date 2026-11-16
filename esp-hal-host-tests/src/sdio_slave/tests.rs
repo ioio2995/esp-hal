@@ -190,3 +190,38 @@ fn cmd5_voltage_argument_selects_only_ocr_bits_twenty_and_twenty_one() {
         assert_eq!((voltage_window(1 << bit) as u32) << 15, expected);
     }
 }
+
+#[test]
+fn bus_enable_rejects_every_incomplete_pad_configuration() {
+    for mask in 0u8..64 {
+        let pads = core::array::from_fn(|index| (mask & (1 << index) != 0).then_some(index));
+        let expected = if mask == 63 {
+            Ok(())
+        } else {
+            Err(Error::MissingPins)
+        };
+        assert_eq!(
+            validate_bus_configuration(State::ControllerReady, &pads),
+            expected,
+            "{mask:06b}"
+        );
+    }
+}
+
+#[test]
+fn pin_configuration_never_reopens_an_active_or_invalidated_session() {
+    for state in STATES {
+        if state == State::ControllerReady {
+            continue;
+        }
+        for mask in 0u8..64 {
+            let pads = core::array::from_fn(|index| (mask & (1 << index) != 0).then_some(index));
+            let error = if state == State::SessionInvalidated {
+                Error::SessionInvalidated
+            } else {
+                Error::InvalidState
+            };
+            assert_eq!(validate_bus_configuration(state, &pads), Err(error));
+        }
+    }
+}
