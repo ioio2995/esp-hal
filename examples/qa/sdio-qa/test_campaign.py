@@ -136,7 +136,8 @@ def go(world, scenarios, script=None):
     FakeConsole.raw = bytearray()
     return flow.run(world["params"], world["consent"], scenarios, world["regions"], world["build"],
                     world["tmp"], world["campaigns"],
-                    world["orchestrators"], world["boards"], FakeConsole, lambda label: None,
+                    world["orchestrators"], world["boards"], FakeConsole,
+                    lambda label: world["calls"].append(("gesture", label)),
                     sleep=lambda s: None, clock=iter(range(0, 1000, 5)).__next__)
 
 
@@ -278,3 +279,15 @@ def test_h1_collection_waits_for_the_third_c6_session(world):
     c6_lines = json.loads((world["campaigns"]["c6"].directory / "uart-h1-lines.json").read_text())["lines"]
     assert len([x for x in c6_lines if x[2].startswith("RESULT")]) == 3
     assert outcome.error is None
+
+
+def test_no_p4_operation_between_c6_preparation_and_c6_programming(world):
+    go(world, ["h1"])
+    calls = world["calls"]
+    first_c6 = next(i for i, c in enumerate(calls) if c[:2] == ("backup", "c6"))
+    program_c6 = next(i for i, c in enumerate(calls) if c[:2] == ("program", "c6"))
+    assert not [c for c in calls[first_c6:program_c6] if len(c) > 1 and c[1] == "p4"]
+    # the operator is asked to put the C6 in download after the P4 backups, before the C6 ones
+    last_p4_backup = max(i for i, c in enumerate(calls) if c[:2] == ("backup", "p4"))
+    gesture = next(i for i, c in enumerate(calls) if c[0] == "gesture" and "C6 in ROM download" in c[1])
+    assert last_p4_backup < gesture < first_c6

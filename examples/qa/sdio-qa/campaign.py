@@ -6,6 +6,8 @@ tests pass doubles, which is how the safeguards below are demonstrated without h
 * the programmed region is computed from the full images (bootloader, table, application at
   flash address 0); a valid table already on the board is never overwritten without the
   operator's explicit consent, and after programming the table read back must be the image's;
+* the C6 is prepared and programmed with no P4 operation in between (its EN pin is wired to a
+  P4 GPIO, so a P4 reset reboots it out of download mode);
 * nothing is written unless both boards have two identical backups of that region (and a
   configured historical backup matches);
 * a board is restored only if a mutation was engaged on it;
@@ -182,8 +184,14 @@ def run(params, consent, scenarios, regions, build, build_dir, campaigns, orches
     outcome = Outcome()
     interrupted = None
     try:
-        for key in ("p4", "c6"):
-            _prepare(key, params, consent, regions, boards, campaigns, orchestrators, outcome)
+        _prepare("p4", params, consent, regions, boards, campaigns, orchestrators, outcome)
+        # The C6 EN pin is wired to a P4 GPIO: any P4 operation or reset can reboot the C6 and
+        # take it out of ROM download. The C6 is therefore identified, backed up and (below)
+        # programmed first thing after the operator puts it in download, with no P4 operation
+        # in between.
+        gesture("put the C6 in ROM download now and do not touch the P4 until the C6 is "
+                "programmed: a P4 reset reboots the C6 through EN")
+        _prepare("c6", params, consent, regions, boards, campaigns, orchestrators, outcome)
         for scenario in scenarios:
             for key, role in (("c6", "slave"), ("p4", "host")):
                 _program(key, scenario, role, params, regions, build, build_dir, boards,
