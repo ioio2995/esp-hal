@@ -192,3 +192,53 @@ def test_historical_backup_divergence_blocks_before_programming(world, tmp_path)
                                                   "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     outcome = go(world, ["h1"])
     assert isinstance(outcome.error, inputs.InputError) and "program" not in kinds(world)
+
+
+class ScriptedConsole:
+    """Delivers scripted chunks per poll; may raise to simulate a lost continuity."""
+    chunks = {}
+    fail_at = None
+
+    def __init__(self, board):
+        self.board, self.polls = board, 0
+        self.assembler = verdict.LineAssembler()
+        self.raw = bytearray()
+
+    def start(self):
+        pass
+
+    def poll(self):
+        self.polls += 1
+        if self.fail_at is not None and self.polls > self.fail_at:
+            raise ConnectionError("continuity interrupted")
+        for text in self.chunks.get(self.board.key, {}).get(self.polls, []):
+            self.raw += text.encode()
+            self.assembler.feed(text.encode())
+
+
+def go_scripted(world, scenario, chunks, fail_at=None):
+    ScriptedConsole.chunks, ScriptedConsole.fail_at = chunks, fail_at
+    world["params"]["scenario_timeout_seconds"] = 100
+    return flow.run(world["params"], [scenario], world["build"], world["tmp"], world["campaigns"],
+                    world["orchestrators"], world["boards"], ScriptedConsole, lambda label: None,
+                    sleep=lambda s: None, clock=iter(range(0, 10000, 1)).__next__)
+
+
+def test_partial_uart_is_saved_when_observation_is_interrupted(world):
+    line = "QA|C6|t=1|boot|firmware=sdio-qa-slave|scenario=h1\r\n"
+    outcome = go_scripted(world, "h1", {"c6": {1: [line]}}, fail_at=1)
+    assert isinstance(outcome.error, ConnectionError)
+    saved = world["campaigns"]["c6"].directory / "uart-h1.log"
+    assert saved.read_bytes() == line.encode()
+    meta = json.loads((world["campaigns"]["c6"].directory / "uart-h1-lines.json").read_text())
+    assert meta["complete_observation"] is False and meta["error"] == "ConnectionError"
+    assert set(outcome.restored) == {"p4", "c6"}  # cleanup still ran after the capture
+
+
+def test_h1_collection_waits_for_the_third_c6_session(world):
+    done = "QA|C6|t=1|RESULT|h1|C6_DONE|state=BusExposed\r\n"
+    p4 = "QA|P4|t=1|RESULT|h1|P4_PASS\r\n"
+    outcome = go_scripted(world, "h1", {"p4": {1: [p4]}, "c6": {1: [done], 3: [done], 5: [done]}})
+    c6_lines = json.loads((world["campaigns"]["c6"].directory / "uart-h1-lines.json").read_text())["lines"]
+    assert len([x for x in c6_lines if x[2].startswith("RESULT")]) == 3
+    assert outcome.error is None

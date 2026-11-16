@@ -25,9 +25,11 @@ use esp_hal::{
     gpio::{Level, Output, OutputConfig},
     main,
     sdmmc::{
+        BlockingError,
         BusWidth,
         CommandFlags,
         Config,
+        Error as SdmmcError,
         ResponseLen as HalResponseLen,
         SdHostController,
         Slot,
@@ -68,6 +70,9 @@ mod voltage {
 }
 
 esp_bootloader_esp_idf::esp_app_desc!();
+
+/// Error text of a command that got no response during a deliberate probe.
+const NO_RESPONSE: &str = "no response from the card";
 
 /// Set only while the host probes a bus that the slave is expected to have released.
 static EXPECT_NO_RESPONSE: AtomicBool = AtomicBool::new(false);
@@ -122,13 +127,17 @@ fn command<'a, C: Command + 'a>(host: &mut Host<'_>, cmd: C) -> Result<C::Resp<'
             flags,
         )
         .map_err(|error| {
-            if EXPECT_NO_RESPONSE.load(Ordering::Relaxed) {
-                // Deliberate probe of a bus the slave may have released: not a command error.
+            // Only a card that does not answer at all is a legitimate result while the slave
+            // is expected to have released the bus. A CRC or any other error never is.
+            if EXPECT_NO_RESPONSE.load(Ordering::Relaxed)
+                && matches!(error, BlockingError::Op(SdmmcError::ResponseTimeout))
+            {
                 qa!("probe_no_response|CMD{}|{:?}", C::INDEX, error);
+                NO_RESPONSE
             } else {
                 qa!("cmd_error|CMD{}|{:?}", C::INDEX, error);
+                "command failed"
             }
-            "command failed"
         })?;
     Ok(<C::Resp<'a> as Response>::from_words(&words))
 }
@@ -297,10 +306,12 @@ fn enumerate_after_gap(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
         EXPECT_NO_RESPONSE.store(false, Ordering::Relaxed);
         match outcome {
             Ok(()) => return Ok(()),
-            Err(reason) => {
-                qa!("enum_attempt_failed|{}|{}", attempt, reason);
+            Err(NO_RESPONSE) => {
+                qa!("enum_attempt_failed|{}|{}", attempt, NO_RESPONSE);
                 delay.delay_millis(300);
             }
+            // Anything else is a real error, not a slave still recreating its driver.
+            Err(other) => return Err(other),
         }
     }
     fail("enumeration of the new session failed", ())
@@ -477,10 +488,12 @@ fn watch_stop_inner(host: &mut Host<'_>, delay: &Delay, tag: &'static str) -> Re
                 qa!("stop_observed|{}|via=ior1_clear", tag);
                 return Ok(());
             }
-            Err(_) => {
+            Err(NO_RESPONSE) => {
                 qa!("stop_observed|{}|via=no_bus_response", tag);
                 return Ok(());
             }
+            // A CRC or any other error is not proof that the bus was released.
+            Err(other) => return fail("unexpected error while observing the stop", other),
         }
     }
     fail("stop of the slave bus was not observed", tag)

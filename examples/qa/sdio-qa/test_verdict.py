@@ -45,8 +45,8 @@ def h1():
         rows += boots("h1")[1:] if n > 1 else boots("h1")
         rows += [("C6", OK_RX.format(k=0)), ("C6", "tx_done|k=0|dma_bytes=64")]
         rows += p4_round(0)
-        rows += [("P4", f"SESSION|h1|{n}|PASS")]
-    return log(*rows, *end("h1"))
+        rows += [("P4", f"SESSION|h1|{n}|PASS"), ("C6", "RESULT|h1|C6_DONE|state=BusExposed")]
+    return log(*rows, ("P4", "RESULT|h1|P4_PASS"))
 
 
 def h2():
@@ -154,7 +154,7 @@ def test_h4_does_not_depend_on_host_wait_duration():
 
 
 def test_expected_no_response_during_stop_is_not_a_failure():
-    rows = h567() + log(("P4", "probe_no_response|CMD52|Timeout"))
+    rows = h567() + log(("P4", "probe_no_response|CMD52|Op(ResponseTimeout)"))
     assert {v.status for v in verdict.evaluate("h567", rows).values()} == {"PASS"}
 
 
@@ -197,3 +197,18 @@ def test_truncated_log_is_indeterminate_not_fail():
     rows = [x for x in h2() if not (x.kind in {"credit_observed", "length_observed"} and
                                     x.fields().get("cum") in {"3", "192"})]
     assert verdict.evaluate("h2", rows)["h2"].status == "INDETERMINATE"
+
+
+def test_crc_error_is_not_accepted_as_no_response():
+    rows = h567() + log(("P4", "probe_no_response|CMD52|Op(ResponseCrc)"))
+    assert {v.status for v in verdict.evaluate("h567", rows).values()} == {"FAIL"}
+    rows = h567() + log(("P4", "probe_no_response|CMD52|Op(ResponseTimeout)"))
+    assert {v.status for v in verdict.evaluate("h567", rows).values()} == {"PASS"}
+
+
+def test_h1_needs_three_c6_terminations():
+    rows = [x for x in h1() if not (x.board == "C6" and x.kind == "RESULT")]
+    rows += log(("C6", "RESULT|h1|C6_DONE|state=BusExposed"))
+    assert verdict.evaluate("h1", rows)["h1"].status == "INDETERMINATE"
+    assert not verdict.run_complete("h1", rows)
+    assert verdict.run_complete("h1", h1() + log(("C6", "RESULT|h1|C6_DONE|state=BusExposed")) * 2)

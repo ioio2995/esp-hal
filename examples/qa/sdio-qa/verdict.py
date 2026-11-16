@@ -85,6 +85,26 @@ def _of(lines, board, kind, contains=""):
     return [x for x in lines if x.board == board and x.kind == kind and contains in x.body]
 
 
+# C6 terminations a complete run produces: H1 reboots the C6 for each of its three sessions.
+C6_RESULTS = {"h1": 3, "h2": 1, "h3": 1, "h4": 1, "h567": 1}
+
+
+def run_complete(scenario, lines):
+    """True once the final session of the scenario reported on both boards."""
+    return (any(x.board == "P4" and x.kind == "RESULT" for x in lines)
+            and sum(1 for x in lines if x.board == "C6" and x.kind == "RESULT")
+            >= C6_RESULTS[scenario])
+
+
+def _failure_lines(lines):
+    """Firmware-reported failures. A probe that found no response is tolerated only when the
+    error is exactly a response timeout; a CRC or any other error is a failure."""
+    bad = [x.body for x in lines if x.kind in {"fail", "cmd_error", "stop_failed"}
+           or "_FAIL" in x.body]
+    return bad + [x.body for x in lines
+                  if x.kind == "probe_no_response" and "ResponseTimeout" not in x.body]
+
+
 def _payload_mismatches(lines):
     return [x.body for x in lines if "first_mismatch=Some" in x.body or "present=false" in x.body]
 
@@ -95,11 +115,11 @@ def _common(verdict, lines, scenario, c6_boots):
     verdict.require("C6 boot banner", len(boots) >= 1, len(boots))
     verdict.check("C6 reboot count", not boots or len(boots) == c6_boots, len(boots))
     verdict.require("P4 boot banner", len(_of(lines, "P4", "boot", f"scenario={scenario}")) == 1)
-    failures = [x.body for x in lines if x.kind in {"fail", "cmd_error", "stop_failed"}
-                or "_FAIL" in x.body]
+    failures = _failure_lines(lines)
     verdict.check("no firmware-reported failure", not failures, failures[:3])
     verdict.require("P4 result", bool(_of(lines, "P4", "RESULT", "P4_PASS")))
-    verdict.require("C6 result", bool(_of(lines, "C6", "RESULT", "C6_DONE")))
+    verdict.require("C6 results", len(_of(lines, "C6", "RESULT", "C6_DONE")) == C6_RESULTS[scenario],
+                    len(_of(lines, "C6", "RESULT", "C6_DONE")))
 
 
 def _values(lines, board, kind, key, contains=""):
@@ -260,8 +280,7 @@ def _h567(lines):
 
 def _common_tail(verdict, lines):
     verdict.check("no payload mismatch", not _payload_mismatches(lines), _payload_mismatches(lines)[:3])
-    failures = [x.body for x in lines if x.kind in {"fail", "cmd_error", "stop_failed"}
-                or "_FAIL" in x.body]
+    failures = _failure_lines(lines)
     verdict.check("no firmware-reported failure", not failures, failures[:3])
     verdict.require("P4 result", bool(_of(lines, "P4", "RESULT", "P4_PASS")))
     verdict.require("C6 result", bool(_of(lines, "C6", "RESULT", "C6_DONE")))

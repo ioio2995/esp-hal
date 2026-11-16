@@ -114,21 +114,31 @@ def _program(key, scenario, role, params, build, build_dir, boards, campaigns, o
 
 def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, clock):
     consoles = {key: make_console(boards[key]) for key in ("p4", "c6")}
-    for key, console in consoles.items():
-        boards[key].console()
-        console.start()
-    gesture(f"{scenario}: release the P4 reset / reset the P4 so it boots; do not reset the C6")
-    deadline = clock() + params.get("scenario_timeout_seconds", 90)
-    while clock() < deadline:
-        for console in consoles.values():
-            console.poll()
-        if all(any(x.kind == "RESULT" for x in c.assembler.lines) for c in consoles.values()):
-            break
-        sleep(0.2)
-    for key, console in consoles.items():
-        campaigns[key].write(f"uart-{scenario}-lines.json",
-                             [[x.board, x.time_ms, x.body] for x in console.assembler.lines])
-        (campaigns[key].directory / f"uart-{scenario}.log").write_bytes(bytes(console.raw))
+    error = None
+    try:
+        for key, console in consoles.items():
+            boards[key].console()
+            console.start()
+        gesture(f"{scenario}: release the P4 reset / reset the P4 so it boots; do not reset the C6")
+        deadline = clock() + params.get("scenario_timeout_seconds", 90)
+        while clock() < deadline:
+            for console in consoles.values():
+                console.poll()
+            lines = consoles["p4"].assembler.lines + consoles["c6"].assembler.lines
+            if verdict.run_complete(scenario, lines):
+                break
+            sleep(0.2)
+    except BaseException as caught:  # noqa: BLE001 - evidence is saved, then the error continues
+        error = caught
+        raise
+    finally:
+        # Partial captures are evidence of the first failure: always keep them, flagged.
+        for key, console in consoles.items():
+            campaigns[key].write(f"uart-{scenario}-lines.json", {
+                "complete_observation": error is None,
+                "error": type(error).__name__ if error else None,
+                "lines": [[x.board, x.time_ms, x.body] for x in console.assembler.lines]})
+            (campaigns[key].directory / f"uart-{scenario}.log").write_bytes(bytes(console.raw))
     return consoles["p4"].assembler.lines + consoles["c6"].assembler.lines
 
 
