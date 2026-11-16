@@ -103,3 +103,10 @@ firmware explicitly requests DMA shutdown; cancelling a future alone only masks
 notifications. A shutdown timeout retains the storage. Neither MCU retries a
 failed packet. Restart the session to retry: both cumulative counters start from
 the fresh C6 reset, and this example does not implement reconnect recovery.
+
+Stopping either direction before validated completion puts the driver in
+`SessionInvalidated`. Storage can be reclaimed after confirmed stop, but
+`enable_bus()` refuses to reopen that instance. Drop it, reset controller and
+host accounting, and create a new session. This also applies to an unused receive
+credit; shutdown does not retract it. Cancelling only an async wait does not
+invalidate the session: the same armed transfer can still be awaited again.

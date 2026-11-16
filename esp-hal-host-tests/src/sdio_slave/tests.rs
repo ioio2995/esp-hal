@@ -1,7 +1,8 @@
 use super::state::*;
 
-const STATES: [State; 8] = [
+const STATES: [State; 9] = [
     State::ControllerReady,
+    State::SessionInvalidated,
     State::BusExposed,
     State::Function1Receiving,
     State::Function1Received,
@@ -23,8 +24,9 @@ fn function_ready_is_only_allowed_with_a_receive_dma() {
 }
 
 #[test]
-fn pads_are_routed_except_in_controller_ready() {
+fn pads_are_released_in_both_stopped_states() {
     assert!(!State::ControllerReady.pads_routed());
+    assert!(!State::SessionInvalidated.pads_routed());
     assert!(State::BusExposed.pads_routed());
     assert!(State::Function1Receiving.pads_routed());
 }
@@ -41,16 +43,16 @@ fn transitions_are_limited_to_the_documented_graph() {
         (Function1Received, ControllerReady),
         (Function1Received, BusExposed),
         (Function1Received, Function1ReceiveError),
-        (Function1ReceiveError, ControllerReady),
-        (Function1Receiving, ControllerReady),
+        (Function1ReceiveError, SessionInvalidated),
+        (Function1Receiving, SessionInvalidated),
         (BusExposed, Function1Transmitting),
         (Function1Transmitting, Function1Transmitted),
         (Function1Transmitting, Function1TransmitError),
         (Function1Transmitted, Function1TransmitError),
-        (Function1Transmitting, ControllerReady),
+        (Function1Transmitting, SessionInvalidated),
         (Function1Transmitted, ControllerReady),
         (Function1Transmitted, BusExposed),
-        (Function1TransmitError, ControllerReady),
+        (Function1TransmitError, SessionInvalidated),
     ];
     for from in STATES {
         for to in STATES {
@@ -117,5 +119,74 @@ fn token_no_replace_sets_bit_zero_without_changing_other_bits() {
         let updated = super::receive::token_no_replace(bits);
         assert_eq!(updated & 1, 1);
         assert_eq!(updated & !1, bits & !1);
+    }
+}
+
+#[test]
+fn receive_cancellation_cannot_publish_a_second_credit_in_the_same_session() {
+    let mut state = State::BusExposed;
+    let mut announced = 0;
+    assert!(state.can_transition_to(State::Function1Receiving));
+    state = State::Function1Receiving;
+    announced += 1;
+    let consumed = 0;
+    // This is the exact state selection used by disable_bus after stop succeeds.
+    state = state.after_disable();
+    assert_eq!(state, State::SessionInvalidated);
+    assert!(state.dma_stopped()); // Memory restitution is still permitted.
+    assert!(!state.pads_routed());
+    assert!(!state.can_transition_to(State::BusExposed));
+    assert!(!state.can_transition_to(State::Function1Receiving));
+    assert_eq!(announced - consumed, 1); // No second arm can increment the counter.
+}
+
+#[test]
+fn outbound_cancellation_requires_a_new_session_too() {
+    for state in [
+        State::Function1Transmitting,
+        State::Function1TransmitError,
+        State::Function1Receiving,
+        State::Function1ReceiveError,
+    ] {
+        assert!(!state.dma_stopped());
+        let stopped = state.after_disable();
+        assert!(state.can_transition_to(stopped));
+        assert_eq!(stopped, State::SessionInvalidated);
+        for next in STATES {
+            assert!(!stopped.can_transition_to(next));
+        }
+    }
+}
+
+#[test]
+fn completed_packets_can_be_reclaimed_and_explicitly_rearmed() {
+    for state in [State::Function1Received, State::Function1Transmitted] {
+        assert!(state.can_transition_to(State::BusExposed));
+        assert_eq!(state.after_disable(), State::ControllerReady);
+        assert!(State::ControllerReady.can_transition_to(State::BusExposed));
+        assert!(State::BusExposed.can_transition_to(State::Function1Receiving));
+        assert!(State::BusExposed.can_transition_to(State::Function1Transmitting));
+    }
+}
+
+#[test]
+fn storage_restitution_is_permitted_only_in_confirmed_stopped_states() {
+    for state in STATES {
+        assert_eq!(
+            state.dma_stopped(),
+            matches!(state, State::ControllerReady | State::SessionInvalidated)
+        );
+    }
+}
+
+#[test]
+fn cmd5_voltage_argument_selects_only_ocr_bits_twenty_and_twenty_one() {
+    use super::voltage::voltage_window;
+    assert_eq!(voltage_window(1 << 20), 0x20);
+    assert_eq!(voltage_window(1 << 21), 0x40);
+    assert_eq!(voltage_window(u32::MAX), 0x60);
+    for bit in 0..32 {
+        let expected = if matches!(bit, 20 | 21) { 1 << bit } else { 0 };
+        assert_eq!((voltage_window(1 << bit) as u32) << 15, expected);
     }
 }

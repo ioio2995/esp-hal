@@ -14,6 +14,10 @@ pub enum State {
     /// The SDIO block is clocked and out of reset. The SDIO pads are not routed
     /// to the controller, so the host cannot see the card.
     ControllerReady,
+    /// DMA shutdown succeeded and the pads are released, but an interrupted
+    /// packet leaves peer byte or credit accounting ambiguous. Recover storage,
+    /// drop this driver, reset both peers' accounting and create a new session.
+    SessionInvalidated,
     /// The SDIO pads are routed to the controller and the function-ready bits
     /// `IOREADY1/2` are cleared. The clock is running and the block is out of
     /// reset.
@@ -55,12 +59,14 @@ pub enum FunctionState {
 }
 
 /// Error returned by state-dependent operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
     /// The operation is not allowed in the current [`State`].
     InvalidState,
+    /// An interrupted transfer requires a new controller/host session.
+    SessionInvalidated,
     /// A DMA buffer is empty or larger than 16380 bytes.
     InvalidBuffer,
     /// A descriptor or buffer is outside internal DMA-accessible RAM.
@@ -86,22 +92,38 @@ impl State {
                 | (State::Function1Received, State::ControllerReady)
                 | (State::Function1Received, State::BusExposed)
                 | (State::Function1Received, State::Function1ReceiveError)
-                | (State::Function1ReceiveError, State::ControllerReady)
-                | (State::Function1Receiving, State::ControllerReady)
+                | (State::Function1ReceiveError, State::SessionInvalidated)
+                | (State::Function1Receiving, State::SessionInvalidated)
                 | (State::BusExposed, State::Function1Transmitting)
                 | (State::Function1Transmitting, State::Function1Transmitted)
                 | (State::Function1Transmitting, State::Function1TransmitError)
                 | (State::Function1Transmitted, State::Function1TransmitError)
-                | (State::Function1Transmitting, State::ControllerReady)
+                | (State::Function1Transmitting, State::SessionInvalidated)
                 | (State::Function1Transmitted, State::ControllerReady)
                 | (State::Function1Transmitted, State::BusExposed)
-                | (State::Function1TransmitError, State::ControllerReady)
+                | (State::Function1TransmitError, State::SessionInvalidated)
         )
     }
 
     /// Whether the SDIO pads are routed to the controller in this state.
     pub const fn pads_routed(self) -> bool {
-        !matches!(self, State::ControllerReady)
+        !self.dma_stopped()
+    }
+
+    /// This classification is used only after both hardware stop checks succeed.
+    pub(super) const fn after_disable(self) -> Self {
+        match self {
+            Self::Function1Receiving
+            | Self::Function1ReceiveError
+            | Self::Function1Transmitting
+            | Self::Function1TransmitError
+            | Self::SessionInvalidated => Self::SessionInvalidated,
+            _ => Self::ControllerReady,
+        }
+    }
+
+    pub(super) const fn dma_stopped(self) -> bool {
+        matches!(self, Self::ControllerReady | Self::SessionInvalidated)
     }
 
     /// Whether the driver may declare a function ready (`IOREADY1`) in this
@@ -141,6 +163,9 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::InvalidState => "operation is not allowed in this state",
+            Self::SessionInvalidated => {
+                "transfer interrupted; create a new session and resynchronize the host"
+            }
             Self::InvalidBuffer => {
                 "buffer must contain 1..=4095 words and transmit length must fit"
             }

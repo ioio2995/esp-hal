@@ -24,8 +24,33 @@
 //! The implementation uses HINF, SLC and SLCHOST (ESP32-C6 TRM chapter 34).
 //! Use function 1 for incremental-address packets. Transmit length is published
 //! as a cumulative 20-bit counter; the host subtracts its consumed-byte count
-//! modulo 2^20. Receive credits are cumulative modulo 4096. After cancelling
-//! an outbound packet, resynchronize both peers before another transfer.
+//! modulo 2^20. Receive credits are cumulative modulo 4096. Interrupting either
+//! direction invalidates this session: shutdown can return memory safely, but
+//! cannot retract a published length or a receive credit. Recover storage, drop
+//! the driver, reset controller and host accounting, then create a new session.
+//!
+//! For register details, see the
+#![doc = concat!(crate::trm_markdown_link!(), ".\n")]
+//! ## Examples
+//!
+//! Construct the native C6 bus with its fixed pads. Borrowing peripherals lets
+//! the application construct another driver after dropping an invalidated one.
+//!
+//! ```rust, no_run
+#![doc = crate::before_snippet!()]
+//! use esp_hal::sdio_slave::{Pins, SdioSlave};
+//! let pins = Pins::new(
+//!     peripherals.GPIO18.reborrow(), peripherals.GPIO19.reborrow(),
+//!     peripherals.GPIO20.reborrow(), peripherals.GPIO21.reborrow(),
+//!     peripherals.GPIO22.reborrow(), peripherals.GPIO23.reborrow(),
+//! );
+//! let mut slave = SdioSlave::new(
+//!     peripherals.HINF.reborrow(), peripherals.SLC.reborrow(),
+//!     peripherals.SLCHOST.reborrow(), pins,
+//! );
+//! slave.enable_bus()?;
+#![doc = crate::after_snippet!()]
+//! ```
 
 use core::{
     marker::PhantomData,
@@ -54,6 +79,7 @@ pub use state::{Error, FunctionState, State};
 /// The six pads of the SDIO Slave bus.
 ///
 /// They are fixed to GPIO18..GPIO23 by IO MUX function 0.
+/// The native bus owns all six pads together, so a partial bus cannot be exposed.
 #[non_exhaustive]
 pub struct Pins<'d> {
     /// `SDIO_CMD`
@@ -93,6 +119,7 @@ impl<'d> Pins<'d> {
 
 /// Raw view of the receive path, for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ReceiveDiagnostics {
     /// First word of the descriptor as the DMA left it (owner, eof, length, size).
     pub descriptor_dw0: u32,
@@ -235,8 +262,12 @@ impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
     /// # Errors
     ///
     /// Returns [`Error::InvalidState`] unless the state is
-    /// [`State::ControllerReady`].
+    /// [`State::ControllerReady`]. Returns [`Error::SessionInvalidated`] after
+    /// an interrupted packet; this instance cannot resume the previous session.
     pub fn enable_bus(&mut self) -> Result<(), Error> {
+        if self.state == State::SessionInvalidated {
+            return Err(Error::SessionInvalidated);
+        }
         let next = State::BusExposed;
         if !self.state.can_transition_to(next) {
             return Err(Error::InvalidState);
@@ -263,6 +294,13 @@ impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
     /// configuration is not restored, the pulls are not changed, the clock is
     /// kept and the block is not reset.
     ///
+    /// If either transfer direction has not reached validated completion, a
+    /// successful stop enters [`State::SessionInvalidated`]. Its buffers can be
+    /// reclaimed, but [`Self::enable_bus`] refuses to reopen this session. A
+    /// pending receive credit or published outbound length cannot be revoked
+    /// safely here. Reset controller and host accounting before a new session.
+    /// After validated completion, stopping enters [`State::ControllerReady`].
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidState`] unless the pads are routed ([`State::BusExposed`] or
@@ -270,7 +308,7 @@ impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
     /// [`State::Function1ReceiveError`], or a transmit state). [`Error::DmaStopTimeout`] if DMA
     /// does not become idle. Storage, pads, and the clock remain owned on timeout.
     pub fn disable_bus(&mut self) -> Result<(), Error> {
-        let next = State::ControllerReady;
+        let next = self.state.after_disable();
         if !self.state.can_transition_to(next) {
             return Err(Error::InvalidState);
         }
@@ -496,7 +534,8 @@ impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
     /// Returns descriptor and buffer storage after disabling the bus.
     ///
     /// This operation permits explicit reuse of the static allocations. It does
-    /// not arm DMA, expose pads, or publish a new token.
+    /// not arm DMA, expose pads, or publish a new token. After cancellation the
+    /// allocations can be reused in a new, resynchronized session only.
     ///
     /// # Errors
     ///
@@ -504,11 +543,11 @@ impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
     pub fn take_receive_buffers(
         &mut self,
     ) -> Result<Option<(&'static mut Descriptor, &'static mut [u32])>, Error> {
-        if self.state != State::ControllerReady {
+        if !self.state.dma_stopped() {
             return Err(Error::InvalidState);
         }
-        // SAFETY: ControllerReady can only be reached after DMA is confirmed
-        // stopped, or before any transfer. take() prevents double restitution.
+        // SAFETY: both stopped states require confirmed DMA shutdown or no
+        // previous transfer. take() prevents double restitution.
         Ok(self
             .receive
             .take()
@@ -733,10 +772,11 @@ impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
     pub fn take_transmit_buffers(
         &mut self,
     ) -> Result<Option<(&'static mut Descriptor, &'static mut [u32])>, Error> {
-        if self.state != State::ControllerReady {
+        if !self.state.dma_stopped() {
             return Err(Error::InvalidState);
         }
-        // SAFETY: ControllerReady requires successful DMA shutdown.
+        // SAFETY: both stopped states require successful DMA shutdown or no
+        // previous transfer. take() prevents double restitution.
         Ok(self.transmit.take().map(|tx| unsafe { tx.into_buffers() }))
     }
 
@@ -861,12 +901,17 @@ impl<'d> SdioSlave<'d, Async> {
 
     /// Waits for an armed host-to-slave packet using SLC0 interrupts.
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidState`] unless a receive is active, or a DMA error.
+    ///
+    /// # Cancellation Safety
+    ///
     /// Dropping this future masks notification. It does not stop DMA or return
     /// storage. Resume the wait, poll completion, or call [`Self::disable_bus`].
     /// This permits cancellation with Embassy without returning DMA-owned RAM.
-    ///
-    /// # Errors
-    /// Returns [`Error::InvalidState`] unless a receive is active, or a DMA error.
+    /// Disabling an incomplete transfer invalidates its peer accounting; recover
+    /// storage and create a new session after resetting controller and host.
     #[instability::unstable]
     pub async fn wait_received(&mut self) -> Result<usize, Error> {
         let mut source = CompletionWait {
@@ -878,11 +923,15 @@ impl<'d> SdioSlave<'d, Async> {
 
     /// Waits for an armed slave-to-host packet using SLC0 interrupts.
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidState`] unless a transmit is active, or a DMA error.
+    ///
+    /// # Cancellation Safety
+    ///
     /// Cancellation masks notification and retains the active transfer and its
     /// storage. Use [`Self::disable_bus`] for explicit cancellation of DMA.
-    ///
-    /// # Errors
-    /// Returns [`Error::InvalidState`] unless a transmit is active, or a DMA error.
+    /// Stopping an incomplete transfer requires a new controller/host session.
     #[instability::unstable]
     pub async fn wait_transmitted(&mut self) -> Result<usize, Error> {
         let mut source = CompletionWait {

@@ -10,4 +10,7 @@ mod receive;
 #[allow(dead_code)]
 mod events;
 
+#[path = "../../../examples/peripheral/sdio/sdio_host/src/voltage.rs"]
+mod voltage;
+
 mod tests;

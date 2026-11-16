@@ -29,6 +29,8 @@ use sdio::{Command, Response, ResponseLen};
 
 const PACKET_LENGTH: usize = 64;
 
+mod voltage;
+
 esp_bootloader_esp_idf::esp_app_desc!();
 
 type Host<'d> = Slot<'d, 1, Blocking>;
@@ -106,7 +108,7 @@ fn enumerate(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
         return Err("card does not announce an I/O function");
     }
     // OCR bits 20 and 21 describe the 3.2..3.4 V windows. No 1.8 V switch.
-    let window = ((inquiry.ocr >> 15) & 0x30) as u16;
+    let window = voltage::voltage_window(inquiry.ocr);
     if window == 0 {
         return Err("no common 3.3 V supply window");
     }
