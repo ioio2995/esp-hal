@@ -1,0 +1,633 @@
+//! SDIO host QA firmware for the ESP32-P4, companion of `sdio-qa-slave` (ESP32-C6).
+//!
+//! The scenario is selected at build time with `SDIO_QA_SCENARIO` (`h1`, `h2`, `h3`, `h4`,
+//! `h567`). See `examples/qa/SDIO-QA.md` for the contracts and the log format.
+//!
+//! The host drives the C6 enable line, enumerates, and follows the slave only through bus-visible
+//! state: the cumulative receive credit (function 1, 0x44), the cumulative published length
+//! (function 1, 0x60) and the CCCR `IOR1` bit. It never retries a transfer.
+//!
+//! Pins: slot 1 routed through the GPIO matrix, CLK GPIO18, CMD GPIO19, DATA0..3 GPIO14..17,
+//! C6 EN on GPIO54, console UART0 TX on GPIO37.
+
+//% CHIP_FILTER: esp32p4
+
+#![no_std]
+#![no_main]
+
+use esp_backtrace as _;
+use esp_hal::{
+    Blocking,
+    delay::Delay,
+    dma::aligned::DmaAlignedMut,
+    gpio::{Level, Output, OutputConfig},
+    main,
+    sdmmc::{
+        BusWidth,
+        CommandFlags,
+        Config,
+        ResponseLen as HalResponseLen,
+        SdHostController,
+        Slot,
+        SlotConfig,
+    },
+    time::Instant,
+    uart::{Config as UartConfig, Uart},
+};
+use esp_println::println;
+use qa_test::sdio_qa::{
+    CANCEL_AFTER_MS,
+    CREDIT_MASK,
+    LENGTH_MASK,
+    ODD_LENGTH,
+    PACKET_LENGTH,
+    PEER_TIMEOUT_MS,
+    SCENARIO,
+    SCENARIO_NAME,
+    SESSION_GAP_MS,
+    Scenario,
+    WINDOW_END,
+    credit_add,
+    first_mismatch,
+    length_add,
+    odd_byte,
+    request_byte,
+    response_byte,
+};
+use sdio::{Command, Response, ResponseLen};
+
+mod voltage {
+    //! Supply window passed to the SDIO crate's CMD5 constructor.
+
+    /// The constructor shifts its 9-bit voltage argument into OCR bits 15..23.
+    pub(super) const fn voltage_window(card_ocr: u32) -> u16 {
+        const SUPPORTED: u32 = (1 << 20) | (1 << 21);
+        ((card_ocr & SUPPORTED) >> 15) as u16
+    }
+}
+
+esp_bootloader_esp_idf::esp_app_desc!();
+
+type Host<'d> = Slot<'d, 1, Blocking>;
+type Result<T> = core::result::Result<T, &'static str>;
+
+fn now_ms() -> u64 {
+    Instant::now().duration_since_epoch().as_millis()
+}
+
+macro_rules! qa {
+    ($($arg:tt)*) => {
+        println!("QA|P4|t={}|{}", now_ms(), format_args!($($arg)*))
+    };
+}
+
+fn fail<T>(step: &'static str, detail: impl core::fmt::Debug) -> Result<T> {
+    qa!("fail|{}|{:?}", step, detail);
+    Err(step)
+}
+
+/// Both cache lines of a transfer buffer belong to this allocation.
+#[repr(C, align(64))]
+struct Packet([u8; 128]);
+
+/// Host-side accounting of what this session has consumed. Recreated for every session.
+struct Accounting {
+    /// Receive credits consumed, cumulative modulo 4096.
+    credits: u32,
+    /// Bytes consumed from the slave, cumulative modulo 2^20.
+    bytes: u32,
+}
+
+fn command<'a, C: Command + 'a>(host: &mut Host<'_>, cmd: C) -> Result<C::Resp<'a>> {
+    let response_len = match <C::Resp<'a> as Response>::LEN {
+        ResponseLen::Zero => HalResponseLen::None,
+        ResponseLen::R48 => HalResponseLen::Short,
+        ResponseLen::R136 => HalResponseLen::Long,
+    };
+    let flags = CommandFlags {
+        wait_complete: true,
+        stop_abort: false,
+        busy: <C::Resp<'a> as Response>::BUSY,
+    };
+    let words = host
+        .command_blocking(
+            C::INDEX,
+            cmd.arg(),
+            response_len,
+            <C::Resp<'a> as Response>::CRC,
+            flags,
+        )
+        .map_err(|error| {
+            qa!("cmd_error|CMD{}|{:?}", C::INDEX, error);
+            "command failed"
+        })?;
+    Ok(<C::Resp<'a> as Response>::from_words(&words))
+}
+
+fn register(
+    host: &mut Host<'_>,
+    function: u8,
+    address: u32,
+    write: Option<u8>,
+    log: bool,
+) -> Result<u8> {
+    let response = command(
+        host,
+        sdio::sdio::Cmd52 {
+            write: write.is_some(),
+            function,
+            raw: false,
+            addr: address,
+            data: write.unwrap_or(0),
+        },
+    )?;
+    if log {
+        qa!(
+            "cmd52|f={}|addr={:#x}|write={}|data_out={:#04x}|r5_data={:#04x}|r5_flags={:#04x}",
+            function,
+            address,
+            write.is_some(),
+            write.unwrap_or(0),
+            response.data,
+            response.flags
+        );
+    }
+    if response.flags & sdio::SdioError::ALL != 0 {
+        return fail("CMD52 R5 error", response.flags);
+    }
+    Ok(response.data)
+}
+
+fn register_u32(host: &mut Host<'_>, address: u32) -> Result<u32> {
+    let mut bytes = [0; 4];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = register(host, 1, address + i as u32, None, false)?;
+    }
+    Ok(u32::from_le_bytes(bytes))
+}
+
+/// Cumulative receive credits announced by the slave (function 1, 0x44, bits 27..16).
+fn credit_cum(host: &mut Host<'_>) -> Result<u32> {
+    Ok((register_u32(host, 0x44)? >> 16) & CREDIT_MASK)
+}
+
+/// Cumulative length published by the slave (function 1, 0x60, 20 bits).
+fn length_cum(host: &mut Host<'_>) -> Result<u32> {
+    Ok(register_u32(host, 0x60)? & LENGTH_MASK)
+}
+
+/// CCCR `IOR1`: function 1 declared ready by the slave.
+fn ior1(host: &mut Host<'_>) -> Result<bool> {
+    Ok(register(host, 0, 3, None, false)? & 2 != 0)
+}
+
+/// Waits for the cumulative credit to become exactly `want`. The only accepted other value is
+/// the previous count; anything else is an unexpected credit.
+fn wait_credit(host: &mut Host<'_>, delay: &Delay, want: u32) -> Result<()> {
+    let previous = credit_add(want, CREDIT_MASK);
+    for _ in 0..PEER_TIMEOUT_MS / 10 {
+        let value = credit_cum(host)?;
+        if value == want {
+            qa!("credit_observed|cum={}|ior1={}", value, ior1(host)?);
+            return Ok(());
+        }
+        if value != previous {
+            return fail("unexpected receive credit", (value, want));
+        }
+        delay.delay_millis(10);
+    }
+    fail("receive credit timed out", want)
+}
+
+fn wait_length(host: &mut Host<'_>, delay: &Delay, previous: u32, length: usize) -> Result<()> {
+    let want = length_add(previous, length as u32);
+    for _ in 0..PEER_TIMEOUT_MS / 10 {
+        let value = length_cum(host)?;
+        if value == want {
+            qa!("length_observed|cum={}|ior1={}", value, ior1(host)?);
+            return Ok(());
+        }
+        if value != previous {
+            return fail("unexpected published length", (value, want));
+        }
+        delay.delay_millis(10);
+    }
+    fail("published length timed out", want)
+}
+
+/// Waits for `IOR1` and returns how long it took, in milliseconds.
+fn wait_ready(host: &mut Host<'_>, delay: &Delay) -> Result<u64> {
+    let started = now_ms();
+    for _ in 0..PEER_TIMEOUT_MS / 10 {
+        if ior1(host)? {
+            let waited = now_ms() - started;
+            qa!("ready_observed|waited_ms={}", waited);
+            return Ok(waited);
+        }
+        delay.delay_millis(10);
+    }
+    fail("function 1 readiness timed out", ())
+}
+
+fn wait_enumerated_ready(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
+    for _ in 0..200 {
+        if register(host, 0, 3, None, false)? & 2 != 0 {
+            return Ok(());
+        }
+        delay.delay_millis(10);
+    }
+    fail("function 1 enable timed out", ())
+}
+
+fn enumerate(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
+    command(host, sdio::common::idle())?;
+    let inquiry = command(host, sdio::sdio::io_send_op_cond(false, 0))?;
+    qa!("enum|CMD5|ocr={:#010x}", inquiry.ocr);
+    if inquiry.ocr == u32::MAX || (inquiry.ocr >> 28) & 7 == 0 {
+        return fail("card does not announce an I/O function", inquiry.ocr);
+    }
+    let window = voltage::voltage_window(inquiry.ocr);
+    if window == 0 {
+        return fail("no common 3.3 V supply window", inquiry.ocr);
+    }
+    let mut ready = false;
+    for _ in 0..40 {
+        if command(host, sdio::sdio::io_send_op_cond(false, window))?.ocr & (1 << 31) != 0 {
+            ready = true;
+            break;
+        }
+        delay.delay_millis(50);
+    }
+    if !ready {
+        return fail("card initialization timed out", ());
+    }
+    let relative = command(host, sdio::sd::Cmd3)?;
+    qa!(
+        "enum|CMD3|rca={:#06x}|status={:#06x}",
+        relative.rca,
+        relative.status
+    );
+    if relative.rca == 0 || relative.status & 0xe000 != 0 {
+        return fail("invalid RCA or R6 status", relative.status);
+    }
+    command(host, sdio::common::select_card(relative.rca))?;
+    register(host, 0, 2, Some(2), true)?;
+    wait_enumerated_ready(host, delay)?;
+    qa!("enum|done");
+    Ok(())
+}
+
+/// Enumerates a session started by the slave after its own pause. Enumeration is not a card
+/// mutation, so it may be attempted again while the slave is still recreating its driver.
+fn enumerate_after_gap(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
+    delay.delay_millis((SESSION_GAP_MS + 1_500) as u32);
+    for attempt in 1..=10 {
+        match enumerate(host, delay) {
+            Ok(()) => return Ok(()),
+            Err(reason) => {
+                qa!("enum_attempt_failed|{}|{}", attempt, reason);
+                delay.delay_millis(300);
+            }
+        }
+    }
+    fail("enumeration of the new session failed", ())
+}
+
+fn check_r5(step: &'static str, response: [u32; 4]) -> Result<()> {
+    qa!("{}|r5={:#010x}", step, response[0]);
+    if ((response[0] >> 8) as u8) & sdio::SdioError::ALL != 0 {
+        return fail("CMD53 R5 error", response[0]);
+    }
+    Ok(())
+}
+
+fn cmd53_argument(length: usize) -> u32 {
+    let address = WINDOW_END - length as u32;
+    (1 << 28) | (1 << 26) | (address << 9) | length as u32
+}
+
+fn dma(buffer: &mut [u8]) -> Result<DmaAlignedMut<'_, [u8]>> {
+    if buffer.len().is_multiple_of(64) {
+        DmaAlignedMut::new(buffer).map_err(|_| "unaligned buffer")
+    } else {
+        // SAFETY: `buffer` is a prefix of a `Packet`, whose two cache lines are owned by this
+        // transfer alone. The odd length is the purpose of the H3 scenario.
+        Ok(unsafe { DmaAlignedMut::new_unchecked(buffer) })
+    }
+}
+
+/// Writes one request to the slave, after its credit and readiness are observed.
+fn send_request(
+    host: &mut Host<'_>,
+    delay: &Delay,
+    accounting: &mut Accounting,
+    k: u32,
+    expect_gate: bool,
+) -> Result<()> {
+    wait_credit(host, delay, credit_add(accounting.credits, 1))?;
+    let waited = wait_ready(host, delay)?;
+    if expect_gate && waited + 50 < CANCEL_AFTER_MS {
+        return fail("readiness was declared before the cancel window", waited);
+    }
+    let published = length_cum(host)?;
+    if published != accounting.bytes {
+        return fail(
+            "length published without a response",
+            (published, accounting.bytes),
+        );
+    }
+    let mut packet = Packet([0; 128]);
+    for (i, byte) in packet.0[..PACKET_LENGTH].iter_mut().enumerate() {
+        *byte = request_byte(SCENARIO, k, i);
+    }
+    let response = host
+        .write_blocks_blocking(
+            53,
+            cmd53_argument(PACKET_LENGTH) | (1 << 31),
+            dma(&mut packet.0[..PACKET_LENGTH])?,
+            PACKET_LENGTH as u16,
+            1,
+        )
+        .map_err(|error| {
+            qa!("cmd_error|CMD53 write|{:?}", error);
+            "CMD53 write failed"
+        })?;
+    check_r5("cmd53_write", response)?;
+    accounting.credits = credit_add(accounting.credits, 1);
+    qa!(
+        "request_sent|k={}|bytes={}|credits_consumed={}",
+        k,
+        PACKET_LENGTH,
+        accounting.credits
+    );
+    Ok(())
+}
+
+/// Reads exactly `length` bytes published by the slave and compares each of them.
+fn read_response(
+    host: &mut Host<'_>,
+    delay: &Delay,
+    accounting: &mut Accounting,
+    length: usize,
+    expected: impl Fn(usize) -> u8,
+    expect_gate: bool,
+    label: &'static str,
+) -> Result<()> {
+    wait_length(host, delay, accounting.bytes, length)?;
+    let waited = wait_ready(host, delay)?;
+    if expect_gate && waited + 50 < CANCEL_AFTER_MS {
+        return fail("readiness was declared before the cancel window", waited);
+    }
+    let credits = credit_cum(host)?;
+    if credits != accounting.credits {
+        return fail(
+            "credit changed while the slave was transmitting",
+            (credits, accounting.credits),
+        );
+    }
+    let mut packet = Packet([0xff; 128]);
+    let response = host
+        .read_blocks_blocking(
+            53,
+            cmd53_argument(length),
+            dma(&mut packet.0[..length])?,
+            length as u16,
+            1,
+        )
+        .map_err(|error| {
+            qa!("cmd_error|CMD53 read|{:?}", error);
+            "CMD53 read failed"
+        })?;
+    check_r5("cmd53_read", response)?;
+    let expected_bytes: [u8; 65] = core::array::from_fn(expected);
+    let mismatch = first_mismatch(&packet.0[..length], &expected_bytes[..length]);
+    // Bytes past the requested length are an observation, not an assertion: the host DMA
+    // descriptor rounds its size up to a whole word.
+    qa!(
+        "response_check|{}|length={}|first_mismatch={:?}|tail={:02x?}",
+        label,
+        length,
+        mismatch,
+        &packet.0[length..(length + 4).min(128)]
+    );
+    if mismatch.is_some() {
+        return fail("response payload mismatch", mismatch);
+    }
+    let rounded = (length + 3) & !3;
+    if packet.0[rounded..].iter().any(|byte| *byte != 0xff) {
+        return fail("bytes were written beyond the word-rounded length", ());
+    }
+    accounting.bytes = length_add(accounting.bytes, length as u32);
+    qa!(
+        "response_consumed|{}|bytes={}|bytes_consumed_cum={}|length_cum={}",
+        label,
+        length,
+        accounting.bytes,
+        length_cum(host)?
+    );
+    Ok(())
+}
+
+fn round(
+    host: &mut Host<'_>,
+    delay: &Delay,
+    accounting: &mut Accounting,
+    k: u32,
+    expect_gate: bool,
+) -> Result<()> {
+    qa!("round_begin|k={}", k);
+    send_request(host, delay, accounting, k, expect_gate)?;
+    read_response(
+        host,
+        delay,
+        accounting,
+        PACKET_LENGTH,
+        |i| response_byte(SCENARIO, k, i),
+        expect_gate,
+        "response",
+    )?;
+    qa!(
+        "round_end|k={}|credits_consumed={}|bytes_consumed={}",
+        k,
+        accounting.credits,
+        accounting.bytes
+    );
+    Ok(())
+}
+
+fn fresh() -> Accounting {
+    Accounting {
+        credits: 0,
+        bytes: 0,
+    }
+}
+
+/// Observes the slave stopping the bus: the pads are released, so CMD52 stops answering or
+/// `IOR1` clears.
+fn watch_stop(host: &mut Host<'_>, delay: &Delay, tag: &'static str) -> Result<()> {
+    for _ in 0..PEER_TIMEOUT_MS / 20 {
+        match ior1(host) {
+            Ok(true) => delay.delay_millis(20),
+            Ok(false) => {
+                qa!("stop_observed|{}|via=ior1_clear", tag);
+                return Ok(());
+            }
+            Err(_) => {
+                qa!("stop_observed|{}|via=no_bus_response", tag);
+                return Ok(());
+            }
+        }
+    }
+    fail("stop of the slave bus was not observed", tag)
+}
+
+fn run_h1(host: &mut Host<'_>, delay: &Delay, en: &mut Output<'_>) -> Result<()> {
+    for session in 1..=3u32 {
+        if session > 1 {
+            reset_c6(en, delay);
+        }
+        qa!("session_begin|h1|{}", session);
+        enumerate(host, delay)?;
+        round(host, delay, &mut fresh(), 0, false)?;
+        qa!("SESSION|h1|{}|PASS", session);
+    }
+    Ok(())
+}
+
+fn run_h2(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
+    enumerate(host, delay)?;
+    let mut accounting = fresh();
+    for k in 1..=3u32 {
+        round(host, delay, &mut accounting, k, false)?;
+        qa!(
+            "progress|k={}|credits_consumed={}|bytes_consumed={}",
+            k,
+            accounting.credits,
+            accounting.bytes
+        );
+    }
+    if accounting.credits != 3 || accounting.bytes != 3 * PACKET_LENGTH as u32 {
+        return fail(
+            "unexpected consumed totals",
+            (accounting.credits, accounting.bytes),
+        );
+    }
+    Ok(())
+}
+
+fn run_h3(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
+    enumerate(host, delay)?;
+    let mut accounting = fresh();
+    read_response(
+        host,
+        delay,
+        &mut accounting,
+        ODD_LENGTH,
+        odd_byte,
+        false,
+        "odd_response",
+    )?;
+    if accounting.bytes != ODD_LENGTH as u32 {
+        return fail("unexpected consumed total", accounting.bytes);
+    }
+    Ok(())
+}
+
+fn run_h4(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
+    enumerate(host, delay)?;
+    round(host, delay, &mut fresh(), 0, true)
+}
+
+fn run_h567(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
+    // H5: the slave arms a receive that this host never consumes, then stops the bus.
+    enumerate(host, delay)?;
+    wait_credit(host, delay, 1)?;
+    wait_ready(host, delay)?;
+    qa!(
+        "h5|armed|credit_cum={}|length_cum={}",
+        credit_cum(host)?,
+        length_cum(host)?
+    );
+    watch_stop(host, delay, "h5")?;
+    qa!("h5|host_did_not_consume_credit|credits_consumed=0");
+
+    // H6: the slave publishes a packet that this host never reads, then stops the bus.
+    enumerate_after_gap(host, delay)?;
+    let credits = credit_cum(host)?;
+    if credits > 1 {
+        return fail("receive credit survived the new session", credits);
+    }
+    wait_length(host, delay, 0, PACKET_LENGTH)?;
+    wait_ready(host, delay)?;
+    qa!(
+        "h6|published|credit_cum={}|length_cum={}",
+        credit_cum(host)?,
+        length_cum(host)?
+    );
+    watch_stop(host, delay, "h6")?;
+    qa!("h6|host_did_not_read|bytes_consumed=0");
+
+    // H7: a new session with fresh host accounting. No old credit or length may reappear.
+    enumerate_after_gap(host, delay)?;
+    qa!(
+        "h7|fresh_session|credit_cum={}|length_cum={}",
+        credit_cum(host)?,
+        length_cum(host)?
+    );
+    round(host, delay, &mut fresh(), 7, false)
+}
+
+/// Holds the C6 in reset, then releases it and waits for its firmware to boot.
+fn reset_c6(en: &mut Output<'_>, delay: &Delay) {
+    en.set_low();
+    qa!("c6_en|low");
+    delay.delay_millis(500);
+    en.set_high();
+    qa!("c6_en|high");
+    delay.delay_millis(2000);
+}
+
+#[main]
+fn main() -> ! {
+    let peripherals = esp_hal::init(esp_hal::Config::default());
+    let delay = Delay::new();
+    // The reference board routes this pin to C6 EN. Keep the C6 in reset during setup.
+    let mut c6_enable = Output::new(peripherals.GPIO54, Level::Low, OutputConfig::default());
+    let _console = Uart::new(
+        peripherals.UART0,
+        UartConfig::default().with_baudrate(115_200),
+    )
+    .unwrap()
+    .with_tx(peripherals.GPIO37);
+    qa!("boot|firmware=sdio-qa-host|scenario={}", SCENARIO_NAME);
+    let controller = SdHostController::new(peripherals.SDHOST, Config::default()).unwrap();
+    let mut host = controller
+        .slot::<1>(SlotConfig::default())
+        .unwrap()
+        .with_clk(peripherals.GPIO18)
+        .with_cmd(peripherals.GPIO19)
+        .with_data0(peripherals.GPIO14)
+        .with_data1(peripherals.GPIO15)
+        .with_data2(peripherals.GPIO16)
+        .with_data3(peripherals.GPIO17);
+    host.set_bus_low_level(BusWidth::Bit1, 400_000).unwrap();
+    delay.delay_millis(100);
+    c6_enable.set_high();
+    qa!("c6_en|high");
+    delay.delay_millis(2000);
+    let result = match SCENARIO {
+        Scenario::H1 => run_h1(&mut host, &delay, &mut c6_enable),
+        Scenario::H2 => run_h2(&mut host, &delay),
+        Scenario::H3 => run_h3(&mut host, &delay),
+        Scenario::H4 => run_h4(&mut host, &delay),
+        Scenario::H567 => run_h567(&mut host, &delay),
+    };
+    match result {
+        Ok(()) => qa!("RESULT|{}|P4_PASS", SCENARIO_NAME),
+        Err(reason) => qa!("RESULT|{}|P4_FAIL|{}", SCENARIO_NAME, reason),
+    }
+    // No retry or further reset: a failed scenario requires a fresh session.
+    loop {
+        delay.delay_millis(1000);
+    }
+}

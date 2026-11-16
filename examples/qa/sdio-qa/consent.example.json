@@ -1,0 +1,8 @@
+{
+  "_comment": "Written by the operator after reviewing the exact commit. The assistant never writes this file.",
+  "commit": "<reviewed commit SHA>",
+  "boards": ["<p4 device id>", "<c6 device id>"],
+  "scenarios": ["h1", "h2", "h3", "h4", "h567"],
+  "effects": "Write the app partition of both boards; reset sequences; GPIO54 driven by the P4 firmware; no full erase, no eFuse, no bootloader or partition-table write.",
+  "operator_statement": "<the operator's own words, with date>"
+}

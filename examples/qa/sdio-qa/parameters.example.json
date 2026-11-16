@@ -1,0 +1,25 @@
+{
+  "_comment": "Template only. Copy to a private directory outside Git and fill from observed identify/partitions results. A template never authorizes any hardware effect.",
+  "build_dir": "/path/to/private/builds/<run>",
+  "expected_source_sha": "<reviewed commit SHA of the SDIO QA branch>",
+  "evidence_root": "/path/to/private/evidence",
+  "p4": {
+    "device": "<logical id of the ESP32-P4 board>",
+    "chip": "esp32p4",
+    "flash_size": 33554432,
+    "transports": ["external_uart"],
+    "app_offset": 0,
+    "app_size": 0,
+    "historical_backup": {"path": "/path/to/private/full-flash.bin", "sha256": "<digest to cross-check>"}
+  },
+  "c6": {
+    "device": "<logical id of the ESP32-C6 board>",
+    "chip": "esp32c6",
+    "flash_size": 0,
+    "transports": ["external_uart"],
+    "app_offset": 0,
+    "app_size": 0
+  },
+  "grant_seconds": 900,
+  "scenario_timeout_seconds": 90
+}
