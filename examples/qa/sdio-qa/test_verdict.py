@@ -139,10 +139,40 @@ def test_firmware_failure_line_fails():
     assert verdict.evaluate("h4", rows)["h4"].status == "FAIL"
 
 
-def test_early_readiness_fails_h4():
-    rows = [x for x in h4() if not x.body.startswith("ready_observed")]
-    rows += log(("P4", "ready_observed|waited_ms=2"), ("P4", "ready_observed|waited_ms=2"))
+def test_h4_slave_order_violation_fails():
+    rows = h4()
+    i = next(n for n, x in enumerate(rows) if x.board == "C6" and x.kind == "tx_done")
+    j = next(n for n, x in enumerate(rows) if x.board == "C6" and x.kind == "cancel_check" and "|tx|" in x.body)
+    rows[i], rows[j] = rows[j], rows[i]
     assert verdict.evaluate("h4", rows)["h4"].status == "FAIL"
+
+
+def test_h4_does_not_depend_on_host_wait_duration():
+    rows = [verdict.Line(x.board, 1, "ready_observed|waited_ms=0") if x.kind == "ready_observed" else x
+            for x in h4()]
+    assert verdict.evaluate("h4", rows)["h4"].status == "PASS"
+
+
+def test_expected_no_response_during_stop_is_not_a_failure():
+    rows = h567() + log(("P4", "probe_no_response|CMD52|Timeout"))
+    assert {v.status for v in verdict.evaluate("h567", rows).values()} == {"PASS"}
+
+
+def test_unexpected_command_error_still_fails():
+    rows = h567() + log(("P4", "cmd_error|CMD52|Timeout"))
+    assert {v.status for v in verdict.evaluate("h567", rows).values()} == {"FAIL"}
+
+
+def test_inconsistent_restitution_fails():
+    rows = [verdict.Line(x.board, 1, x.body.replace("other_direction_empty=true", "other_direction_empty=false"))
+            for x in h567()]
+    result = verdict.evaluate("h567", rows)
+    assert result["h5"].status == "FAIL" and result["h6"].status == "FAIL"
+
+
+def test_demonstrated_violation_outranks_missing_evidence():
+    rows = [x for x in h3() if x.kind != "RESULT"] + log(("P4", "fail|CMD53 read|Timeout"))
+    assert verdict.evaluate("h3", rows)["h3"].status == "FAIL"
 
 
 def test_h3_requires_exactly_65_bytes():
@@ -161,3 +191,9 @@ def test_assembler_joins_split_chunks_and_ignores_noise():
     for chunk in (b"boot noise\nQA|C6|t=5|bo", b"ot|firmware=x|scenario=h1\r\nQA|P4|t=6|x"):
         assembler.feed(chunk)
     assert [(x.board, x.body) for x in assembler.lines] == [("C6", "boot|firmware=x|scenario=h1")]
+
+
+def test_truncated_log_is_indeterminate_not_fail():
+    rows = [x for x in h2() if not (x.kind in {"credit_observed", "length_observed"} and
+                                    x.fields().get("cum") in {"3", "192"})]
+    assert verdict.evaluate("h2", rows)["h2"].status == "INDETERMINATE"

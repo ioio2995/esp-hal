@@ -59,8 +59,20 @@ class Verdict:
 
     def check(self, name, ok, detail=""):
         self.checks.append({"check": name, "ok": bool(ok), "detail": str(detail)})
-        if not ok and self.status == "PASS":
+        if not ok:
+            # A demonstrated violation outranks missing evidence.
             self.status = "FAIL"
+
+    def sequence(self, name, observed, expected):
+        """Exact list match. A strict prefix is truncated evidence (INDETERMINATE); any other
+        difference is a demonstrated violation (FAIL)."""
+        observed, expected = list(observed), list(expected)
+        if observed == expected:
+            self.check(name, True, observed)
+        elif observed == expected[:len(observed)]:
+            self.require(name, False, f"truncated: {observed} of {expected}")
+        else:
+            self.check(name, False, f"{observed} != {expected}")
 
     def require(self, name, present, detail=""):
         """Evidence that must exist; its absence is INDETERMINATE, never PASS."""
@@ -97,59 +109,63 @@ def _values(lines, board, kind, key, contains=""):
 def _h1(lines):
     v = Verdict()
     _common(v, lines, "h1", 3)
-    sessions = _of(lines, "P4", "SESSION")
-    v.require("three fresh sessions passed", [x.body for x in sessions] ==
-              [f"SESSION|h1|{n}|PASS" for n in (1, 2, 3)], len(sessions))
-    v.require("C6 validated 64 bytes three times",
-              len(_of(lines, "C6", "rx_check", OK_REQUEST)) == 3)
-    v.require("C6 transmitted 64 bytes three times",
-              _values(lines, "C6", "tx_done", "dma_bytes") == ["64"] * 3)
-    v.require("P4 validated 64 bytes three times",
-              len(_of(lines, "P4", "response_check", "length=64|first_mismatch=None")) == 3)
-    v.check("credit 1 and length 64 in every session",
-            _values(lines, "P4", "credit_observed", "cum") == ["1"] * 3 and
-            _values(lines, "P4", "length_observed", "cum") == ["64"] * 3)
+    v.sequence("three fresh sessions passed", [x.body for x in _of(lines, "P4", "SESSION")],
+               [f"SESSION|h1|{n}|PASS" for n in (1, 2, 3)])
+    v.sequence("C6 validated 64 bytes three times",
+               [1 for _ in _of(lines, "C6", "rx_check", OK_REQUEST)], [1] * 3)
+    v.sequence("C6 transmitted 64 bytes three times",
+               _values(lines, "C6", "tx_done", "dma_bytes"), ["64"] * 3)
+    v.sequence("P4 validated 64 bytes three times",
+               [1 for _ in _of(lines, "P4", "response_check", "length=64|first_mismatch=None")],
+               [1] * 3)
+    v.sequence("credit 1 in every session", _values(lines, "P4", "credit_observed", "cum"),
+               ["1"] * 3)
+    v.sequence("length 64 in every session", _values(lines, "P4", "length_observed", "cum"),
+               ["64"] * 3)
     return v
 
 
 def _h2(lines):
     v = Verdict()
     _common(v, lines, "h2", 1)
-    v.require("C6 validated three requests",
-              len(_of(lines, "C6", "rx_check", OK_REQUEST)) == 3)
-    v.check("credits advance one per packet",
-            _values(lines, "P4", "credit_observed", "cum") == ["1", "2", "3"],
-            _values(lines, "P4", "credit_observed", "cum"))
-    v.check("published length advances 64 per packet",
-            _values(lines, "P4", "length_observed", "cum") == ["64", "128", "192"],
-            _values(lines, "P4", "length_observed", "cum"))
-    v.check("host consumed exactly 64 bytes per response",
-            _values(lines, "P4", "response_consumed", "bytes_consumed_cum") == ["64", "128", "192"])
-    v.check("host consumed three credits", _values(lines, "P4", "progress", "credits_consumed") ==
-            ["1", "2", "3"])
-    v.require("P4 validated three responses",
-              len(_of(lines, "P4", "response_check", "length=64|first_mismatch=None")) == 3)
-    v.check("slave announced credits 1, 2, 3",
-            [x.fields().get("token") for x in lines if x.board == "C6" and x.kind == "diag"
-             and x.body.split("|")[1] == "rx_armed"] == ["1", "2", "3"])
-    v.check("slave published 64, 128, 192",
-            [x.fields().get("published") for x in lines if x.board == "C6" and x.kind == "diag"
-             and x.body.split("|")[1] == "tx_armed"] == ["64", "128", "192"])
-    v.check("direction changes without leaving BusExposed",
-            _values(lines, "C6", "round_end", "state") == ["BusExposed"] * 3)
+    v.sequence("C6 validated three requests",
+               [1 for _ in _of(lines, "C6", "rx_check", OK_REQUEST)], [1] * 3)
+    v.sequence("credits advance one per packet",
+               _values(lines, "P4", "credit_observed", "cum"), ["1", "2", "3"])
+    v.sequence("published length advances 64 per packet",
+               _values(lines, "P4", "length_observed", "cum"), ["64", "128", "192"])
+    v.sequence("host consumed exactly 64 bytes per response",
+               _values(lines, "P4", "response_consumed", "bytes_consumed_cum"),
+               ["64", "128", "192"])
+    v.sequence("host consumed one credit per round",
+               _values(lines, "P4", "progress", "credits_consumed"), ["1", "2", "3"])
+    v.sequence("P4 validated three responses",
+               [1 for _ in _of(lines, "P4", "response_check", "length=64|first_mismatch=None")],
+               [1] * 3)
+    v.sequence("slave announced credits 1, 2, 3",
+               [x.fields().get("token") for x in lines if x.board == "C6" and x.kind == "diag"
+                and x.body.split("|")[1] == "rx_armed"], ["1", "2", "3"])
+    v.sequence("slave published 64, 128, 192",
+               [x.fields().get("published") for x in lines if x.board == "C6"
+                and x.kind == "diag" and x.body.split("|")[1] == "tx_armed"],
+               ["64", "128", "192"])
+    v.sequence("direction changes without leaving BusExposed",
+               _values(lines, "C6", "round_end", "state"), ["BusExposed"] * 3)
     return v
 
 
 def _h3(lines):
     v = Verdict()
     _common(v, lines, "h3", 1)
-    v.check("slave published exactly 65 bytes", _values(lines, "P4", "length_observed", "cum")
-            == ["65"], _values(lines, "P4", "length_observed", "cum"))
-    v.require("host received 65 matching bytes",
-              len(_of(lines, "P4", "response_check", "length=65|first_mismatch=None")) == 1)
-    v.check("host consumed 65 bytes", _values(lines, "P4", "response_consumed",
-            "bytes_consumed_cum") == ["65"])
-    v.check("slave DMA transmitted 65 bytes", _values(lines, "C6", "tx_done", "dma_bytes") == ["65"])
+    v.sequence("slave published exactly 65 bytes",
+               _values(lines, "P4", "length_observed", "cum"), ["65"])
+    v.sequence("host received 65 matching bytes",
+               [1 for _ in _of(lines, "P4", "response_check", "length=65|first_mismatch=None")],
+               [1])
+    v.sequence("host consumed 65 bytes",
+               _values(lines, "P4", "response_consumed", "bytes_consumed_cum"), ["65"])
+    v.sequence("slave DMA transmitted 65 bytes", _values(lines, "C6", "tx_done", "dma_bytes"),
+               ["65"])
     v.check("no receive credit published", _values(lines, "P4", "credit_observed", "cum") == [])
     return v
 
@@ -160,21 +176,30 @@ def _h4(lines):
     for direction in ("rx", "tx"):
         v.require(f"{direction} wait started then cancelled",
                   len(_of(lines, "C6", "cancel", f"|{direction}|")) == 1)
-        v.check(f"{direction} DMA still armed, no extra credit/length",
-                [x.body.rsplit("=", 1)[1] for x in _of(lines, "C6", "cancel_check",
-                 f"|{direction}|")] == ["true"])
-    v.require("C6 validated 64 bytes after the resumed wait",
-              len(_of(lines, "C6", "rx_check", OK_REQUEST)) == 1)
-    v.check("slave completed the resumed transmit", _values(lines, "C6", "tx_done", "dma_bytes")
-            == ["64"])
-    waits = [int(w) for w in _values(lines, "P4", "ready_observed", "waited_ms")]
-    v.check("host saw readiness only after both cancel windows",
-            len(waits) == 2 and all(w >= 250 for w in waits), waits)
-    v.check("host credit and length stayed exact",
-            _values(lines, "P4", "credit_observed", "cum") == ["1"] and
-            _values(lines, "P4", "length_observed", "cum") == ["64"])
-    v.require("P4 validated the response",
-              len(_of(lines, "P4", "response_check", "length=64|first_mismatch=None")) == 1)
+        v.sequence(f"{direction} DMA unchanged, no completion event, no extra credit/length",
+                   [x.body.rsplit("=", 1)[1] for x in _of(lines, "C6", "cancel_check",
+                                                          f"|{direction}|")], ["true"])
+    v.sequence("C6 validated 64 bytes after the resumed wait",
+               [1 for _ in _of(lines, "C6", "rx_check", OK_REQUEST)], [1])
+    v.sequence("slave completed the resumed transmit",
+               _values(lines, "C6", "tx_done", "dma_bytes"), ["64"])
+    # Order of the slave's own observations: cancel, then the matching transfer completes.
+    c6 = [x for x in lines if x.board == "C6"]
+
+    def index(kind, contains):
+        return next((i for i, x in enumerate(c6) if x.kind == kind and contains in x.body), None)
+
+    order = [index("cancel_check", "|rx|"), index("rx_check", ""), index("cancel_check", "|tx|"),
+             index("tx_done", "")]
+    v.require("slave observations are all present", None not in order, order)
+    v.check("cancellation precedes every host transfer on the slave",
+            None in order or order == sorted(order), order)
+    v.sequence("host credit stayed exact", _values(lines, "P4", "credit_observed", "cum"), ["1"])
+    v.sequence("host length stayed exact", _values(lines, "P4", "length_observed", "cum"),
+               ["64"])
+    v.sequence("P4 validated the response",
+               [1 for _ in _of(lines, "P4", "response_check", "length=64|first_mismatch=None")],
+               [1])
     return v
 
 
@@ -185,17 +210,21 @@ def _stop(lines, tag, direction):
     stop = _of(lines, "C6", "stop", f"|{tag}|")
     v.require(f"{tag}: stop result reported", len(stop) == 1)
     v.check(f"{tag}: stop confirmed and session invalidated",
-            len(stop) == 1 and "result=Ok(())" in stop[0].body
-            and "state=SessionInvalidated" in stop[0].body, [x.body for x in stop])
+            not stop or ("result=Ok(())" in stop[0].body
+                         and "state=SessionInvalidated" in stop[0].body), [x.body for x in stop])
     after = [x for x in lines if x.board == "C6" and x.kind == "diag"
              and x.body.split("|")[1] == "after_stop" and direction in x.body]
     v.require(f"{tag}: DMA PARK observed after stop",
               any("park=true" in x.body for x in after), "register observation")
-    v.check(f"{tag}: storage returned after the stop only",
-            len(_of(lines, "C6", "restitution", f"|{tag}|")) == 1)
+    restitution = _of(lines, "C6", "restitution", f"|{tag}|")
+    v.require(f"{tag}: storage restitution reported", len(restitution) == 1)
+    v.check(f"{tag}: other direction empty after restitution",
+            not restitution or restitution[0].fields().get("other_direction_empty") == "true",
+            [x.body for x in restitution])
     reopen = _of(lines, "C6", "reopen", f"|{tag}|")
+    v.require(f"{tag}: reopen attempt reported", len(reopen) == 1)
     v.check(f"{tag}: enable_bus refuses the instance",
-            len(reopen) == 1 and "Err(SessionInvalidated)" in reopen[0].body)
+            not reopen or "Err(SessionInvalidated)" in reopen[0].body)
     v.require(f"{tag}: host observed the stop",
               len(_of(lines, "P4", "stop_observed", f"|{tag}|")) == 1)
     return v

@@ -78,3 +78,48 @@ def test_image_larger_than_partition_is_refused(case):
     row["image_sha256"], row["image_size"] = hashlib.sha256(big.read_bytes()).hexdigest(), 8192
     with pytest.raises(inputs.InputError, match="does not fit"):
         inputs.validate(params, consent, build, directory)
+
+
+TABLE = [
+    {"label": "nvs", "type": 1, "subtype": 2, "address": 0x9000, "size": 0x6000},
+    {"label": "factory", "type": 0, "subtype": 0, "address": 0x110000, "size": 0x100000},
+    {"label": "storage", "type": 1, "subtype": 1, "address": 0x210000, "size": 0x100000},
+]
+SPEC = {"app_offset": 0x110000, "app_size": 0x100000}
+
+
+def test_exact_app_partition_is_accepted():
+    assert inputs.check_partition(TABLE, SPEC)["label"] == "factory"
+
+
+@pytest.mark.parametrize("spec,table,message", [
+    ({"app_offset": 0x210000, "app_size": 0x100000}, TABLE, "not an application"),
+    ({"app_offset": 0x110000, "app_size": 0x200000}, TABLE, "differs from the observed"),
+    ({"app_offset": 0x111000, "app_size": 0x1000}, TABLE, "no single partition"),
+    (SPEC, TABLE[:1] + [{"label": "f", "type": 0, "subtype": 0, "address": 0x110000, "size": 0x100000},
+                        {"label": "o", "type": 1, "subtype": 1, "address": 0x1ff000, "size": 0x2000}],
+     "overlaps"),
+])
+def test_wrong_partition_or_overflow_is_refused(spec, table, message):
+    with pytest.raises(inputs.InputError, match=message):
+        inputs.check_partition(table, spec)
+
+
+def test_grant_must_cover_a_restoration(case):
+    params, consent, build, directory = case
+    params["grant_seconds"] = 900
+    inputs.validate(params, consent, build, directory)
+    params["grant_seconds"] = inputs.budget(inputs.RESTORE_TIMEOUT) - 1
+    with pytest.raises(inputs.InputError, match="grant_seconds"):
+        inputs.validate(params, consent, build, directory)
+    assert inputs.budget(600) == 1290  # the Orchestrator default that 900 s cannot satisfy
+
+
+def test_historical_backup_divergence_blocks():
+    data = bytes(range(256)) * 32
+    declared = {"sha256": hashlib.sha256(data).hexdigest()}
+    inputs.check_historical(declared, data, data[4096:8192], 4096, 4096)
+    with pytest.raises(inputs.InputError, match="differs from the fresh"):
+        inputs.check_historical(declared, data, b"\0" * 4096, 4096, 4096)
+    with pytest.raises(inputs.InputError, match="declared SHA-256"):
+        inputs.check_historical({"sha256": "0" * 64}, data, data[4096:8192], 4096, 4096)

@@ -1,0 +1,194 @@
+"""Software-only tests of the campaign flow with doubles. They show the safeguards without any
+board; they are simulations and never hardware evidence."""
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+spec = importlib.util.spec_from_file_location("sdio_qa_campaign", Path(__file__).with_name("campaign.py"))
+flow = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(flow)
+inputs, verdict = flow.inputs, flow.verdict
+
+SHA = "a" * 40
+TABLE = [{"label": "factory", "type": 0, "subtype": 0, "address": 0x110000, "size": 0x100000}]
+
+
+class Calls(list):
+    pass
+
+
+class Campaign:
+    def __init__(self, tmp, name):
+        self.directory = tmp / name
+        self.directory.mkdir()
+        self.closed, self.results = False, []
+
+    def write(self, name, value):
+        (self.directory / name).write_text(json.dumps(value, default=str))
+
+    def result(self, test_id, status, **kw):
+        self.results.append((test_id, status))
+
+    def close(self):
+        self.closed = True
+
+
+class Board:
+    def __init__(self, key, calls, spec):
+        self.key, self.calls, self.spec, self.table = key, calls, spec, TABLE
+
+    def identify(self):
+        return {"chip": self.spec["chip"], "flash_size": self.spec["flash_size"]}
+
+    def partitions(self):
+        return self.table
+
+    def renew(self, ttl):
+        self.calls.append(("renew", self.key))
+
+    def console(self):
+        pass
+
+    def cursor(self):
+        return 0
+
+    def events(self, cursor):
+        return []
+
+
+class Orchestrator:
+    def __init__(self, key, calls, tmp, differ=False):
+        self.key, self.calls, self.tmp, self.differ, self.n = key, calls, tmp, differ, 0
+        self.grant = 0
+
+    def backup(self, board, *, address, size, filename, timeout):
+        self.n += 1
+        data = b"\1" * 16 if not (self.differ and filename == "backup-b.bin") else b"\2" * 16
+        path = self.tmp / f"{self.key}-{filename}"
+        path.write_bytes(data)
+        self.calls.append(("backup", self.key, timeout))
+        return path, {"sha256": hashlib.sha256(data).hexdigest()}
+
+    def wait_ready(self, *, timeout, grant_seconds):
+        self.grant = grant_seconds
+
+    def program(self, board, *, address, source, sha256, allow_destructive, timeout):
+        # Same budget rule as iobewi_bench.Orchestrator.program().
+        assert self.grant >= 2 * timeout + 90, "grant too short for programming and readback"
+        assert ("renew", self.key) in self.calls
+        self.calls.append(("program", self.key, Path(source).name))
+
+    def restore(self, board, backup, *, allow_destructive, timeout):
+        assert self.grant >= 2 * timeout + 90, "grant too short for restoration"
+        self.calls.append(("restore", self.key))
+
+    def compare(self, board, backup, *, timeout):
+        self.calls.append(("compare", self.key))
+        return {"equal": True}
+
+
+@pytest.fixture
+def world(tmp_path):
+    calls = Calls()
+    params = {"expected_source_sha": SHA, "scenario_timeout_seconds": 1,
+              "p4": {"device": "p", "chip": "esp32p4", "flash_size": 1 << 25, "app_offset": 0x110000,
+                     "app_size": 0x100000},
+              "c6": {"device": "c", "chip": "esp32c6", "flash_size": 1 << 22, "app_offset": 0x110000,
+                     "app_size": 0x100000}}
+    build = {"artifacts": [{"scenario": s, "role": r, "image": f"{s}-{r}.bin", "elf_sha256": "0",
+                            "image_sha256": "0"} for s in ("h1", "h2") for r in ("host", "slave")]}
+    campaigns = {k: Campaign(tmp_path, k) for k in ("p4", "c6")}
+    return {"calls": calls, "params": params, "build": build, "tmp": tmp_path, "campaigns": campaigns,
+            "boards": {k: Board(k, calls, params[k]) for k in ("p4", "c6")},
+            "orchestrators": {k: Orchestrator(k, calls, tmp_path) for k in ("p4", "c6")}}
+
+
+class FakeConsole:
+    script = {}
+
+    def __init__(self, board):
+        self.board = board
+        self.assembler = verdict.LineAssembler()
+
+    def start(self):
+        for text in self.script.get(self.board.key, []):
+            self.assembler.feed(text.encode())
+
+    def poll(self):
+        pass
+
+    raw = b""
+
+
+def go(world, scenarios, script=None):
+    FakeConsole.script = script or {}
+    FakeConsole.raw = bytearray()
+    return flow.run(world["params"], scenarios, world["build"], world["tmp"], world["campaigns"],
+                    world["orchestrators"], world["boards"], FakeConsole, lambda label: None,
+                    sleep=lambda s: None, clock=iter(range(0, 1000, 5)).__next__)
+
+
+def kinds(world):
+    return [c[0] for c in world["calls"]]
+
+
+def test_c6_backup_mismatch_blocks_everything_and_restores_nothing(world):
+    world["orchestrators"]["c6"].differ = True
+    outcome = go(world, ["h1"])
+    assert isinstance(outcome.error, inputs.InputError)
+    assert "program" not in kinds(world)
+    assert "restore" not in kinds(world) and "compare" not in kinds(world)
+    assert all(c.closed for c in world["campaigns"].values())
+
+
+def test_data_partition_is_refused_before_any_backup(world):
+    world["boards"]["p4"].table = [dict(TABLE[0], type=1)]
+    outcome = go(world, ["h1"])
+    assert isinstance(outcome.error, inputs.InputError)
+    assert kinds(world) == []
+
+
+def test_partition_overflow_is_refused_before_any_backup(world):
+    world["params"]["p4"]["app_size"] = 0x200000
+    outcome = go(world, ["h1"])
+    assert isinstance(outcome.error, inputs.InputError) and kinds(world) == []
+
+
+def test_first_failing_scenario_stops_programming_and_restores_programmed_boards(world):
+    outcome = go(world, ["h1", "h2"])  # empty consoles: H1 is INDETERMINATE, not PASS
+    programmed = [c for c in world["calls"] if c[0] == "program"]
+    assert {c[2] for c in programmed} == {"h1-slave.bin", "h1-host.bin"}
+    assert not any("h2" in c[2] for c in programmed)
+    assert outcome.failed_verdicts and set(outcome.restored) == {"p4", "c6"}
+    assert [c[1] for c in world["calls"] if c[0] == "restore"] == ["c6", "p4"]
+
+
+def test_only_the_board_with_an_engaged_mutation_is_restored(world):
+    orchestrator = world["orchestrators"]["p4"]
+
+    def failing(*args, **kwargs):
+        raise RuntimeError("write failed")
+
+    world["orchestrators"]["c6"].program = failing
+    outcome = go(world, ["h1"])
+    assert outcome.mutated == {"c6"}
+    assert [c for c in world["calls"] if c[0] in {"restore", "program"} and c[1] == "p4"] == []
+    assert [c for c in world["calls"] if c[0] == "restore"] == [("restore", "c6")]
+    assert orchestrator.grant == 0
+
+
+def test_grant_budget_is_requested_for_programming_and_restoration(world):
+    go(world, ["h1"])
+    assert world["orchestrators"]["c6"].grant >= inputs.budget(inputs.RESTORE_TIMEOUT)
+
+
+def test_historical_backup_divergence_blocks_before_programming(world, tmp_path):
+    path = tmp_path / "hist.bin"
+    path.write_bytes(b"\0" * 0x110000 + b"\3" * 16 + b"\0" * 0x100000)
+    world["params"]["p4"]["historical_backup"] = {"path": str(path),
+                                                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    outcome = go(world, ["h1"])
+    assert isinstance(outcome.error, inputs.InputError) and "program" not in kinds(world)

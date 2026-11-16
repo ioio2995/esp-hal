@@ -141,6 +141,35 @@ pub const fn length_add(base: u32, n: u32) -> u32 {
     base.wrapping_add(n) & LENGTH_MASK
 }
 
+/// Descriptor word 0 as the driver lays it out (`receive.rs`): bit 31 owner (1 = DMA), bit 30
+/// EOF, bits 27..14 length, bits 13..0 capacity. This is an interpretation of the raw word.
+pub const fn descriptor_owner_dma(dw0: u32) -> bool {
+    dw0 >> 31 == 1
+}
+
+/// EOF bit of the descriptor word. A transmit descriptor is armed with EOF already set: the bit
+/// describes the end of the packet, it is not a completion event.
+pub const fn descriptor_eof(dw0: u32) -> bool {
+    (dw0 >> 30) & 1 == 1
+}
+
+/// Length field, 14 bits.
+pub const fn descriptor_length(dw0: u32) -> u32 {
+    (dw0 >> 14) & 0x3fff
+}
+
+/// Capacity field, 14 bits.
+pub const fn descriptor_capacity(dw0: u32) -> u32 {
+    dw0 & 0x3fff
+}
+
+/// SLC0 raw interrupt bits that signal completion or a fault of the host-to-slave DMA
+/// (`events.rs` RECEIVE_EVENTS: 15, 19, 11).
+pub const RECEIVE_EVENT_BITS: u32 = (1 << 15) | (1 << 19) | (1 << 11);
+/// SLC0 raw interrupt bits that signal completion or a fault of the slave-to-host DMA
+/// (`events.rs` TRANSMIT_EVENTS: 17, 20, 10).
+pub const TRANSMIT_EVENT_BITS: u32 = (1 << 17) | (1 << 20) | (1 << 10);
+
 /// Index of the first differing byte, or the shorter length if one slice is a prefix.
 pub fn first_mismatch(a: &[u8], b: &[u8]) -> Option<usize> {
     let common = a.len().min(b.len());
@@ -201,6 +230,25 @@ mod tests {
         assert_eq!(credit_add(4095, 1), 0);
         assert_eq!(length_delta(63, LENGTH_MASK - 0), 64);
         assert_eq!(length_add(LENGTH_MASK, 1), 0);
+    }
+
+    #[test]
+    fn descriptor_fields_use_fourteen_bits() {
+        let transmit_64 = (1u32 << 31) | (1 << 30) | (64 << 14) | 512;
+        assert_eq!(descriptor_length(transmit_64), 64);
+        assert_eq!(descriptor_capacity(transmit_64), 512);
+        assert!(descriptor_owner_dma(transmit_64) && descriptor_eof(transmit_64));
+        let transmit_65 = (1u32 << 31) | (1 << 30) | (65 << 14) | 128;
+        assert_eq!(descriptor_length(transmit_65), 65);
+        assert_eq!(descriptor_capacity(transmit_65), 128);
+        let armed_receive = (1u32 << 31) | 128;
+        assert!(descriptor_owner_dma(armed_receive) && !descriptor_eof(armed_receive));
+        assert_eq!(descriptor_length(armed_receive), 0);
+    }
+
+    #[test]
+    fn event_masks_do_not_overlap() {
+        assert_eq!(RECEIVE_EVENT_BITS & TRANSMIT_EVENT_BITS, 0);
     }
 
     #[test]

@@ -11,8 +11,45 @@ SCENARIOS = ("h1", "h2", "h3", "h4", "h567")
 BOARD_KEYS = {"device", "chip", "flash_size", "transports", "app_offset", "app_size"}
 
 
+PROGRAM_TIMEOUT = 120
+RESTORE_TIMEOUT = 300
+MAX_APP_SIZE = 4 * 1024 * 1024
+
+
 class InputError(ValueError):
     pass
+
+
+def budget(timeout):
+    """Seconds of grant and reservation `Orchestrator.program()` demands for one operation:
+    a write, an independent readback, two start windows and a margin."""
+    return 2 * timeout + 90
+
+
+def check_partition(table, spec):
+    """The declared region must be exactly one application partition of the observed table."""
+    rows = [p for p in table if p.get("address") == spec["app_offset"]]
+    if len(rows) != 1:
+        raise InputError("no single partition starts at app_offset in the observed table")
+    row = rows[0]
+    if row.get("type") != 0:
+        raise InputError("the partition at app_offset is not an application partition")
+    if row.get("size") != spec["app_size"]:
+        raise InputError("app_size differs from the observed partition size")
+    end = spec["app_offset"] + spec["app_size"]
+    for other in table:
+        if other is not row and other["address"] < end and spec["app_offset"] < other["address"] + other["size"]:
+            raise InputError("the declared region overlaps another partition")
+    return row
+
+
+def check_historical(declared, data, fresh, offset, size):
+    """A configured historical backup is a prerequisite: it must match its digest and the
+    freshly read partition, otherwise programming is blocked."""
+    if hashlib.sha256(data).hexdigest() != declared["sha256"]:
+        raise InputError("historical backup does not match its declared SHA-256")
+    if data[offset:offset + size] != fresh:
+        raise InputError("historical backup differs from the fresh read of the partition")
 
 
 def sha256_file(path):
@@ -43,6 +80,12 @@ def validate(params, consent, build_manifest, build_dir):
             raise InputError(f"parameters.{role}.app_offset must be a sector-aligned app partition")
         if not _sectors(board["app_size"]) or board["app_offset"] + board["app_size"] > board["flash_size"]:
             raise InputError(f"parameters.{role}.app_size must be whole sectors inside the flash")
+    grant = params.get("grant_seconds", 900)
+    if type(grant) is not int or not budget(RESTORE_TIMEOUT) <= grant <= 14400:
+        raise InputError(f"grant_seconds must cover a restoration: at least {budget(RESTORE_TIMEOUT)}")
+    for role in ("p4", "c6"):
+        if params[role]["app_size"] > MAX_APP_SIZE:
+            raise InputError(f"parameters.{role}.app_size exceeds the budgeted {MAX_APP_SIZE} bytes")
     if params["p4"]["device"] == params["c6"]["device"]:
         raise InputError("the P4 and the C6 must be distinct logical boards")
     commit = params.get("expected_source_sha")

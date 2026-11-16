@@ -33,10 +33,16 @@ use qa_test::sdio_qa::{
     ODD_LENGTH,
     PACKET_LENGTH,
     PEER_TIMEOUT_MS,
+    RECEIVE_EVENT_BITS,
     SCENARIO,
     SCENARIO_NAME,
     SESSION_GAP_MS,
     Scenario,
+    TRANSMIT_EVENT_BITS,
+    descriptor_capacity,
+    descriptor_eof,
+    descriptor_length,
+    descriptor_owner_dma,
     first_mismatch,
     odd_byte,
     request_byte,
@@ -121,10 +127,10 @@ fn diag_rx(tag: &str, slave: &SdioSlave<'_, Async>) {
          token={} int_raw={:#010x} park={}",
         tag,
         d.descriptor_dw0,
-        d.descriptor_dw0 >> 31,
-        (d.descriptor_dw0 >> 30) & 1,
-        (d.descriptor_dw0 >> 12) & 0xfff,
-        d.descriptor_dw0 & 0xfff,
+        descriptor_owner_dma(d.descriptor_dw0) as u8,
+        descriptor_eof(d.descriptor_dw0) as u8,
+        descriptor_length(d.descriptor_dw0),
+        descriptor_capacity(d.descriptor_dw0),
         d.token,
         d.interrupt_raw,
         d.parked
@@ -138,10 +144,10 @@ fn diag_tx(tag: &str, slave: &SdioSlave<'_, Async>) {
          published={} int_raw={:#010x} park={}",
         tag,
         d.descriptor_dw0,
-        d.descriptor_dw0 >> 31,
-        (d.descriptor_dw0 >> 30) & 1,
-        (d.descriptor_dw0 >> 12) & 0xfff,
-        d.descriptor_dw0 & 0xfff,
+        descriptor_owner_dma(d.descriptor_dw0) as u8,
+        descriptor_eof(d.descriptor_dw0) as u8,
+        descriptor_length(d.descriptor_dw0),
+        descriptor_capacity(d.descriptor_dw0),
         d.published_length,
         d.interrupt_raw,
         d.parked
@@ -227,10 +233,13 @@ async fn round(
         }
         let after = slave.receive_diagnostics();
         diag_rx("rx_after_cancel", slave);
+        // The descriptor word and the credit must be exactly what they were before the wait,
+        // and no receive completion or fault event may be pending.
         let held = slave.state() == State::Function1Receiving
             && slave.received().is_none()
-            && after.descriptor_dw0 >> 31 == 1
-            && (after.descriptor_dw0 >> 30) & 1 == 0
+            && descriptor_owner_dma(after.descriptor_dw0)
+            && after.descriptor_dw0 == before.descriptor_dw0
+            && after.interrupt_raw & RECEIVE_EVENT_BITS == 0
             && after.token == before.token;
         qa!(
             "cancel_check|rx|dma_still_armed_and_no_extra_credit={}",
@@ -276,9 +285,12 @@ async fn round(
         }
         let after = slave.transmit_diagnostics();
         diag_tx("tx_after_cancel", slave);
+        // A transmit descriptor is armed with EOF already set (end of packet): only an unchanged
+        // word, DMA ownership and the absence of a completion or fault event prove it is pending.
         let held = slave.state() == State::Function1Transmitting
-            && after.descriptor_dw0 >> 31 == 1
-            && (after.descriptor_dw0 >> 30) & 1 == 0
+            && descriptor_owner_dma(after.descriptor_dw0)
+            && after.descriptor_dw0 == before.descriptor_dw0
+            && after.interrupt_raw & TRANSMIT_EVENT_BITS == 0
             && after.published_length == before.published_length;
         qa!(
             "cancel_check|tx|dma_still_armed_and_no_extra_length={}",

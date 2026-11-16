@@ -18,6 +18,7 @@ differs from the qualified base commit and records that proof in the build manif
 | `build.py` | Reproducible build of the five scenario pairs and `build-manifest.json` |
 | `verdict.py`, `test_verdict.py` | Console parsing and verdict logic; software tests on synthetic logs |
 | `inputs.py`, `test_inputs.py` | Refusal of templates, unreviewed builds and mismatched consent |
+| `campaign.py`, `test_campaign.py` | Campaign flow with injectable collaborators; safeguards tested with doubles |
 | `test_sdio_qa_hardware.py` | Opt-in Device Lab recipe (`iobewi_bench`), skipped by default |
 | `parameters.example.json`, `consent.example.json` | Templates. A template authorizes nothing. |
 
@@ -69,11 +70,11 @@ therefore starts a fresh C6 session. Only the app partitions are written.
 
 | ID | Objective | Assertions (both firmwares check, `verdict.py` re-checks from the logs) |
 | --- | --- | --- |
-| H0 | Identify, back up, program | Chip and flash size equal the manifest; two reads of each app partition are identical; programming has an independent `flash.read` equal to the image; no erase. |
+| H0 | Identify, back up, program | Chip and flash size equal the parameters; the region is exactly one application partition (type 0, same address and size, no overlap) of the observed table; two reads of each app partition are identical and, if configured, match the historical backup, otherwise no write; programming has an independent `flash.read` equal to the image; no erase. |
 | H1 | 64-byte round trip, three fresh sessions | Enumeration; P4->C6 and C6->P4 payloads compared byte for byte on both sides (`0..63` ramp, echoed as in the public example); credit 1 and length 64 in every session; three C6 reboots. |
 | H2 | Reuse in one session | Three round trips without reset or re-enumeration; the pattern changes with every packet and the response is independent of the request; credits 1,2,3 and cumulative length 64,128,192; host consumed exactly 64 bytes and one credit per round; no credit appears without a re-armed resource; state returns to `BusExposed` between directions. |
 | H3 | 65-byte C6 -> P4 | Allocation of 128 bytes, exactly 65 published and read with a CMD53 of count 65; length announced 65, received 65, each byte compared; bytes past the word-rounded length are observed. |
-| H4 | Cancel a wait, then resume (both directions) | A real wait is started and cancelled by timeout; the state stays armed, the descriptor is still DMA-owned, no EOF, no extra credit or length; `IOR1` is declared only afterwards and the host sees it no earlier than the cancel window; the resumed wait completes with the exact content. |
+| H4 | Cancel a wait, then resume (both directions) | A real wait is started and cancelled by timeout; the state stays armed, the descriptor word is exactly what it was before the wait and still DMA-owned, no completion or fault event is pending, no extra credit or length; `IOR1` is declared only afterwards (so the slave's own log proves cancellation precedes the host transfer; the host's wait duration is not an assertion); the resumed wait completes with the exact content. A transmit descriptor is armed with EOF already set (end of packet): that bit is not a completion event. |
 | H5 | Stop an unused receive | Restitution refused while DMA is active; `disable_bus()` result and PARK observed; restitution only after confirmed stop; state `SessionInvalidated`; `enable_bus()` refuses the instance; the host sees the bus released and consumed nothing. |
 | H6 | Stop an unconsumed transmit | Same contract, with the published length 64 still visible to the host before the stop. |
 | H7 | Resynchronize | Storage reused in a new driver instance (the first clock user resets the block); host accounting recreated and the host re-enumerates; no stale credit (0 or 1 right after enumeration, then exactly 1) or length (exactly 64); a new 64-byte round trip validates. |
@@ -112,6 +113,18 @@ completion, and uses only public driver API. A `park=true` observation is a regi
 observation, not an exhaustive safety proof. Software interpretation, register observation
 and unobservable properties are reported separately.
 
+## Campaign safeguards
+
+* The campaign stops at the first scenario that is not `PASS`; evidence is kept, nothing more
+  is programmed, then cleanup runs.
+* A board is restored only if a write was engaged on it. A backup alone is not a reason.
+* Operations are budgeted for `Orchestrator.program()`: `2 x timeout + 90` seconds of grant and
+  reservation (programming 120 s -> 330 s; restoration and backups 300 s -> 690 s). The
+  parameters must grant at least 690 s; the reservation is renewed before every write.
+* Verdict priority: a demonstrated violation is `FAIL`; a truncated or missing trace is
+  `INDETERMINATE`. A deliberate probe of a released bus (`probe_no_response`) is not an error;
+  any other `cmd_error` is.
+
 ## Review and campaign gate (repository rules)
 
 Per `AGENTS.md` of the Device Lab repository (`rust_dev`), section "Méthode obligatoire:
@@ -145,9 +158,10 @@ project owner for the campaign. A PR, a green CI or a pytest opt-in is not that 
 ## Software checks (no hardware)
 
 ```sh
-python -m pytest examples/qa/sdio-qa/test_verdict.py examples/qa/sdio-qa/test_inputs.py -q
+python -m pytest examples/qa/sdio-qa/test_verdict.py examples/qa/sdio-qa/test_inputs.py \
+  examples/qa/sdio-qa/test_campaign.py -q
 rustc --edition 2024 --test examples/qa/src/sdio_qa.rs -o /tmp/sdio_qa_tests && /tmp/sdio_qa_tests
 ```
 
-These use synthetic logs and a pure Rust module. They validate the verdict and input logic
+These use synthetic logs and a pure Rust module (including descriptor decoding). They validate the verdict and input logic
 only; a simulated PASS is never a hardware PASS.

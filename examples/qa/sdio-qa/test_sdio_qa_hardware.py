@@ -19,32 +19,23 @@ Contract per phase (details in SDIO-QA.md):
 No operation is retried. A failure stops the campaign at the first failed step and restoration
 still runs; an unknown outcome is recorded as INDETERMINATE.
 """
-import hashlib
 import importlib.util
-import json
 import sys
-import time
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("iobewi_bench")
-from iobewi_bench.client import BenchError  # noqa: E402
 from iobewi_bench.orchestration import Orchestrator  # noqa: E402
 from iobewi_bench.qualification import Campaign  # noqa: E402
 
 HERE = Path(__file__).parent
 
 
-def _module(name):
-    spec = importlib.util.spec_from_file_location("sdio_qa_" + name, HERE / (name + ".py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-verdict = _module("verdict")
-inputs = _module("inputs")
+spec = importlib.util.spec_from_file_location("sdio_qa_campaign", HERE / "campaign.py")
+campaign_flow = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(campaign_flow)
+inputs = campaign_flow.inputs
 
 pytestmark = pytest.mark.bench
 
@@ -72,26 +63,6 @@ def _manifest(params, scenarios, evidence_root):
         "close_criteria": ["App partitions restored and compared, reservations released, grants revoked."],
         "private_evidence": str(evidence_root),
     }
-
-
-class Console:
-    """One board's UART events assembled into QA lines for the current scenario."""
-
-    def __init__(self, board):
-        self.board, self.cursor = board, None
-        self.assembler = verdict.LineAssembler()
-        self.raw = bytearray()
-
-    def start(self):
-        self.cursor = self.board.cursor()
-
-    def poll(self):
-        import base64
-        for event in self.board.events(self.cursor):
-            if event["kind"] == "uart":
-                data = base64.b64decode(event["data"], validate=True)
-                self.raw += data
-                self.assembler.feed(data)
 
 
 def _gesture(label, interactive):
@@ -125,91 +96,19 @@ def test_sdio_qualification(bench_client, bench_run_dir, pytestconfig):
                                   "build_manifest_sha256": inputs.sha256_file(build_dir / "build-manifest.json")},
                                   parameters=params)
         campaigns[key].start()
-        campaigns[key].write("support-sha256.json", {n: inputs.sha256_file(HERE / (n + ".py")) for n in ("verdict", "inputs")})
+        campaigns[key].write("support-sha256.json", {n: inputs.sha256_file(HERE / (n + ".py")) for n in ("verdict", "inputs", "campaign")})
         orchestrators[key] = Orchestrator(campaigns[key])
-    restored, backups, results = {}, {}, {}
+    ttl = 1800
     try:
-        ttl = 1800
         for key in ("p4", "c6"):
             boards[key] = campaigns[key].reserve(ttl=ttl)
-        # H0 identification and backup. Two identical reads are required before any write.
-        for key in ("p4", "c6"):
-            board, spec = boards[key], params[key]
-            identity = board.identify()
-            campaigns[key].write("h0-identify.json", {k: identity.get(k) for k in ("chip", "flash_size")})
-            assert identity["chip"] == spec["chip"] and identity["flash_size"] == spec["flash_size"]
-            table = board.partitions()
-            campaigns[key].write("h0-partitions.json", table)
-            assert any(int(p.get("offset", -1)) == spec["app_offset"] for p in table), \
-                "app_offset is not a partition of the observed table"
-            a, meta_a = orchestrators[key].backup(board, address=spec["app_offset"], size=spec["app_size"],
-                                                  filename="backup-a.bin")
-            b, meta_b = orchestrators[key].backup(board, address=spec["app_offset"], size=spec["app_size"],
-                                                  filename="backup-b.bin")
-            assert meta_a["sha256"] == meta_b["sha256"], "two reads of the app partition differ: no write allowed"
-            backups[key] = a
-        history = params["p4"].get("historical_backup")
-        if history:
-            data = Path(history["path"]).read_bytes()
-            slice_ = data[params["p4"]["app_offset"]:params["p4"]["app_offset"] + params["p4"]["app_size"]]
-            campaigns["p4"].write("h0-historical-crosscheck.json", {
-                "historical_file_sha256": hashlib.sha256(data).hexdigest(),
-                "declared_sha256": history["sha256"],
-                "slice_equals_fresh_backup": slice_ == backups["p4"].read_bytes()})
-
-        for scenario in scenarios:
-            rows = {r["role"]: r for r in build["artifacts"] if r["scenario"] == scenario}
-            for key, role in (("c6", "slave"), ("p4", "host")):
-                row = rows[role]
-                _gesture(f"{scenario}: put the {key.upper()} in loader mode as declared; "
-                         f"hold the P4 in reset while the C6 is loaded", interactive)
-                orchestrators[key].wait_ready(timeout=300, grant_seconds=params.get("grant_seconds", 900))
-                orchestrators[key].program(boards[key], address=params[key]["app_offset"],
-                                           source=build_dir / row["image"], sha256=row["image_sha256"],
-                                           allow_destructive=True)
-                campaigns[key].write(f"h0-program-{scenario}.json", {
-                    "image_sha256": row["image_sha256"], "elf_sha256": row["elf_sha256"],
-                    "address": params[key]["app_offset"], "readback": "independent flash.read equal"})
-            consoles = {key: Console(boards[key]) for key in ("p4", "c6")}
-            for key, console in consoles.items():
-                boards[key].console()
-                console.start()
-            _gesture(f"{scenario}: release the P4 reset / reset the P4 so it boots; do not reset the C6", interactive)
-            deadline = time.monotonic() + params.get("scenario_timeout_seconds", 90)
-            while time.monotonic() < deadline:
-                for console in consoles.values():
-                    console.poll()
-                lines = consoles["p4"].assembler.lines + consoles["c6"].assembler.lines
-                if any(x.kind == "RESULT" for x in consoles["p4"].assembler.lines) and any(
-                        x.kind == "RESULT" for x in consoles["c6"].assembler.lines):
-                    break
-                time.sleep(0.2)
-            lines = consoles["p4"].assembler.lines + consoles["c6"].assembler.lines
-            for key, console in consoles.items():
-                (campaigns[key].directory / f"uart-{scenario}.log").write_bytes(bytes(console.raw))
-            for test_id, outcome in verdict.evaluate(scenario, lines).items():
-                results[test_id] = outcome
-                campaigns["p4"].result(test_id, outcome.status, preconditions=f"build {params['expected_source_sha']}",
-                                       evidence=json.dumps(outcome.checks)[:2000], incidents="",
-                                       restoration="pending", limits="app partitions only")
-        failed = {k: v.status for k, v in results.items() if v.status != "PASS"}
-        assert not failed, f"scenario verdicts: {failed}"
-    finally:
-        errors = []
-        for key in ("c6", "p4"):
-            try:
-                if key in backups:
-                    _gesture(f"restore {key.upper()}: put it in loader mode again", interactive)
-                    orchestrators[key].wait_ready(timeout=300, grant_seconds=params.get("grant_seconds", 900))
-                    orchestrators[key].restore(boards[key], backups[key], allow_destructive=True)
-                    restored[key] = orchestrators[key].compare(boards[key], backups[key])
-                    campaigns[key].write("restoration.json", restored[key])
-            except (BenchError, AssertionError, TimeoutError, OSError) as error:
-                errors.append((key, type(error).__name__))
+    except BaseException:
         for campaign in campaigns.values():
-            try:
-                campaign.close()
-            except BaseException as error:  # noqa: BLE001 - reported with the restoration outcome
-                errors.append(("close", type(error).__name__))
-        if errors:
-            pytest.fail(f"restoration or cleanup incomplete: {errors}", pytrace=False)
+            campaign.close()
+        raise
+    outcome = campaign_flow.run(
+        params, scenarios, build, build_dir, campaigns, orchestrators, boards,
+        campaign_flow.Console, lambda label: _gesture(label, interactive), ttl=ttl)
+    assert not outcome.cleanup_errors, f"restoration or cleanup incomplete: {outcome.cleanup_errors}"
+    assert outcome.error is None, f"campaign stopped: {type(outcome.error).__name__}: {outcome.error}"
+    assert not outcome.failed_verdicts, f"scenario verdicts: {outcome.failed_verdicts}"
