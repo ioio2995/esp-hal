@@ -212,3 +212,8 @@ def test_h1_needs_three_c6_terminations():
     assert verdict.evaluate("h1", rows)["h1"].status == "INDETERMINATE"
     assert not verdict.run_complete("h1", rows)
     assert verdict.run_complete("h1", h1() + log(("C6", "RESULT|h1|C6_DONE|state=BusExposed")) * 2)
+
+
+def test_transient_not_ready_polls_are_informational():
+    rows = h1() + log(("P4", "poll_not_ready|length|r5_flags=0x12|ior1=true"))
+    assert verdict.evaluate("h1", rows)["h1"].status == "PASS"

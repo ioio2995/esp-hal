@@ -110,9 +110,22 @@ without retry. The R6 status describes the command received before CMD3, so a CR
 does not by itself identify CMD0, CMD5 or CMD3. Run 7 (a4932806, without the init clocks)
 failed H1 at CMD3 with status 0x8000; that result is kept as the earlier outcome.
 
+## Polling function 1
+
+The driver withdraws `IOR1` at every completion until the next explicit arm, and the slave then
+refuses function-1 accesses with FUNCTION_NUMBER (observed: run 8, R5 flags 0x12, 4 ms after the
+P4 write). The host therefore reads function 1 only while `IOR1` (function 0, always accessible)
+is set, for the credits and the lengths alike, inside one global 10 s bound. During these polling
+reads a FUNCTION_NUMBER refusal alone is a transient "not ready", logged as
+`poll_not_ready|<what>|r5_flags=..|ior1=..` (the first three occurrences, and the count in the
+`credit_observed` / `length_observed` line); any other R5 error flag stays blocking. No CMD53 and
+no write is ever repeated. The refusal is a hypothesis for the run 8 failure, to be confirmed by
+the next H1-only run. The earlier outcome of run 8 (enumeration passed, 64 bytes P4 to C6
+validated, FAIL on the poll) is kept.
+
 ## Log format
 
-Both UART cursors are armed before any console is opened, because opening the P4 port may boot
+Both UART cursors are armed before any console is opened, and the C6 console is opened before the P4 console, because opening the P4 port may boot
 the P4 (which resets the C6) and the boot banners must be captured. Both consoles print `QA|<P4|C6>|t=<ms since boot>|<kind>|key=value...`. The clocks are
 independent; correlate with the bench UART timestamps and with `c6_en|low`/`c6_en|high`
 (the C6 boots when EN rises). Evidence lines:

@@ -206,36 +206,124 @@ fn ior1(host: &mut Host<'_>) -> Result<bool> {
     Ok(register(host, 0, 3, None, false)? & 2 != 0)
 }
 
-/// Waits for the cumulative credit to become exactly `want`. The only accepted other value is
-/// the previous count; anything else is an unexpected credit.
+/// One function-1 register read made while polling for a state change.
+enum Probe<T> {
+    Value(T),
+    /// The slave refused the access with FUNCTION_NUMBER: function 1 is not ready at this instant.
+    NotReady(u8),
+}
+
+/// Reads one function-1 byte for polling. Only the FUNCTION_NUMBER flag is a transient "not
+/// ready" (the driver withdraws `IOR1` at each completion until the next explicit arm); every
+/// other R5 error flag is blocking. It never repeats a CMD53 or a write.
+fn probe_register(host: &mut Host<'_>, address: u32) -> Result<Probe<u8>> {
+    let response = command(
+        host,
+        sdio::sdio::Cmd52 {
+            write: false,
+            function: 1,
+            raw: false,
+            addr: address,
+            data: 0,
+        },
+    )?;
+    let errors = response.flags & sdio::SdioError::ALL;
+    if errors == 0 {
+        Ok(Probe::Value(response.data))
+    } else if errors == sdio::SdioError::FLAG_FUNCTION_NUMBER {
+        Ok(Probe::NotReady(response.flags))
+    } else {
+        fail("CMD52 R5 error", response.flags)
+    }
+}
+
+fn probe_u32(host: &mut Host<'_>, address: u32) -> Result<Probe<u32>> {
+    let mut bytes = [0; 4];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        match probe_register(host, address + i as u32)? {
+            Probe::Value(value) => *byte = value,
+            Probe::NotReady(flags) => return Ok(Probe::NotReady(flags)),
+        }
+    }
+    Ok(Probe::Value(u32::from_le_bytes(bytes)))
+}
+
+/// Waits for the cumulative credit to become exactly `want`. Function 1 is only read while `IOR1`
+/// (function 0, always accessible) is set; a FUNCTION_NUMBER refusal while polling is logged and
+/// polled again inside the single global bound. The only accepted other value is the previous
+/// count; anything else is an unexpected credit.
 fn wait_credit(host: &mut Host<'_>, delay: &Delay, want: u32) -> Result<()> {
     let previous = credit_add(want, CREDIT_MASK);
-    for _ in 0..PEER_TIMEOUT_MS / 10 {
-        let value = credit_cum(host)?;
-        if value == want {
-            qa!("credit_observed|cum={}|ior1={}", value, ior1(host)?);
-            return Ok(());
+    let started = now_ms();
+    let mut not_ready = 0u32;
+    while now_ms() - started < PEER_TIMEOUT_MS {
+        if !ior1(host)? {
+            delay.delay_millis(10);
+            continue;
         }
-        if value != previous {
-            return fail("unexpected receive credit", (value, want));
+        match probe_u32(host, 0x44)? {
+            Probe::NotReady(flags) => {
+                not_ready += 1;
+                if not_ready <= 3 {
+                    qa!("poll_not_ready|credit|r5_flags={:#04x}|ior1=true", flags);
+                }
+                delay.delay_millis(5);
+            }
+            Probe::Value(raw) => {
+                let value = (raw >> 16) & CREDIT_MASK;
+                if value == want {
+                    qa!(
+                        "credit_observed|cum={}|ior1={}|not_ready_polls={}",
+                        value,
+                        ior1(host)?,
+                        not_ready
+                    );
+                    return Ok(());
+                }
+                if value != previous {
+                    return fail("unexpected receive credit", (value, want));
+                }
+                delay.delay_millis(10);
+            }
         }
-        delay.delay_millis(10);
     }
     fail("receive credit timed out", want)
 }
 
 fn wait_length(host: &mut Host<'_>, delay: &Delay, previous: u32, length: usize) -> Result<()> {
     let want = length_add(previous, length as u32);
-    for _ in 0..PEER_TIMEOUT_MS / 10 {
-        let value = length_cum(host)?;
-        if value == want {
-            qa!("length_observed|cum={}|ior1={}", value, ior1(host)?);
-            return Ok(());
+    let started = now_ms();
+    let mut not_ready = 0u32;
+    while now_ms() - started < PEER_TIMEOUT_MS {
+        if !ior1(host)? {
+            delay.delay_millis(10);
+            continue;
         }
-        if value != previous {
-            return fail("unexpected published length", (value, want));
+        match probe_u32(host, 0x60)? {
+            Probe::NotReady(flags) => {
+                not_ready += 1;
+                if not_ready <= 3 {
+                    qa!("poll_not_ready|length|r5_flags={:#04x}|ior1=true", flags);
+                }
+                delay.delay_millis(5);
+            }
+            Probe::Value(raw) => {
+                let value = raw & LENGTH_MASK;
+                if value == want {
+                    qa!(
+                        "length_observed|cum={}|ior1={}|not_ready_polls={}",
+                        value,
+                        ior1(host)?,
+                        not_ready
+                    );
+                    return Ok(());
+                }
+                if value != previous {
+                    return fail("unexpected published length", (value, want));
+                }
+                delay.delay_millis(10);
+            }
         }
-        delay.delay_millis(10);
     }
     fail("published length timed out", want)
 }
@@ -469,11 +557,15 @@ fn read_response(
     }
     accounting.bytes = length_add(accounting.bytes, length as u32);
     qa!(
-        "response_consumed|{}|bytes={}|bytes_consumed_cum={}|length_cum={}",
+        "response_consumed|{}|bytes={}|bytes_consumed_cum={}|length_cum={:?}",
         label,
         length,
         accounting.bytes,
-        length_cum(host)?
+        // The slave withdraws IOR1 when it completes the transfer: the read may be refused.
+        match probe_u32(host, 0x60)? {
+            Probe::Value(raw) => Some(raw & LENGTH_MASK),
+            Probe::NotReady(_) => None,
+        }
     );
     Ok(())
 }

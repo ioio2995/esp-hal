@@ -190,7 +190,9 @@ def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, 
         # boot the P4, which resets the C6, and their boot banners must be captured.
         for console in consoles.values():
             console.start()
-        for key in consoles:
+        # The C6 console is opened first: opening the P4 port may boot the P4, which resets the C6,
+        # and the C6 boot banner is lost if its own port is not open by then.
+        for key in ("c6", "p4"):
             boards[key].console()
         gesture(f"{scenario}: reset the P4 so that it boots the scenario (it resets the C6 itself)")
         deadline = clock() + params.get("scenario_timeout_seconds", 90)

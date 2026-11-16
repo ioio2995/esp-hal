@@ -427,6 +427,8 @@ def test_both_cursors_are_armed_before_any_console_is_opened_for_the_scenario(wo
     first_console = next(i for i, c in enumerate(after) if c[0] == "console")
     armed = {c[1] for c in after[:first_console] if c[0] == "cursor"}
     assert armed == {"p4", "c6"}
+    opens = [c[1] for c in after if c[0] == "console"]
+    assert opens[:2] == ["c6", "p4"], "the C6 console must be opened before the P4 console"
 
 
 def test_the_p4_cursor_is_armed_before_its_console_is_opened(world):
