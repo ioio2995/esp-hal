@@ -13,7 +13,8 @@ spec.loader.exec_module(flow)
 inputs, verdict = flow.inputs, flow.verdict
 
 SHA = "a" * 40
-TABLE = [{"label": "factory", "type": 0, "subtype": 0, "address": 0x110000, "size": 0x100000}]
+TABLE = [{"label": "factory", "type": 0, "subtype": 0, "address": 0x10000, "size": 0x100000}]
+LAYOUT = {"write_address": 0, "partitions": TABLE}
 
 
 class Calls(list):
@@ -37,14 +38,22 @@ class Campaign:
 
 
 class Board:
+    """Blank flash (no valid table) until it is programmed, then the image's table."""
+
     def __init__(self, key, calls, spec):
-        self.key, self.calls, self.spec, self.table = key, calls, spec, TABLE
+        self.key, self.calls, self.spec = key, calls, spec
+        self.existing = None  # a valid table present before programming, if a test sets one
+        self.written = TABLE
 
     def identify(self):
         return {"chip": self.spec["chip"], "flash_size": self.spec["flash_size"]}
 
     def partitions(self):
-        return self.table
+        if ("program", self.key) in [c[:2] for c in self.calls]:
+            return self.written
+        if self.existing is None:
+            raise RuntimeError("Operation x failed: partition_table_invalid")
+        return self.existing
 
     def renew(self, ttl):
         self.calls.append(("renew", self.key))
@@ -94,14 +103,13 @@ class Orchestrator:
 def world(tmp_path):
     calls = Calls()
     params = {"expected_source_sha": SHA, "scenario_timeout_seconds": 1,
-              "p4": {"device": "p", "chip": "esp32p4", "flash_size": 1 << 25, "app_offset": 0x110000,
-                     "app_size": 0x100000},
-              "c6": {"device": "c", "chip": "esp32c6", "flash_size": 1 << 22, "app_offset": 0x110000,
-                     "app_size": 0x100000}}
+              "p4": {"device": "p", "chip": "esp32p4", "flash_size": 1 << 25},
+              "c6": {"device": "c", "chip": "esp32c6", "flash_size": 1 << 23}}
     build = {"artifacts": [{"scenario": s, "role": r, "image": f"{s}-{r}.bin", "elf_sha256": "0",
-                            "image_sha256": "0"} for s in ("h1", "h2") for r in ("host", "slave")]}
+                            "image_sha256": "0", "image_size": 4096, "layout": LAYOUT} for s in ("h1", "h2") for r in ("host", "slave")]}
     campaigns = {k: Campaign(tmp_path, k) for k in ("p4", "c6")}
-    return {"calls": calls, "params": params, "build": build, "tmp": tmp_path, "campaigns": campaigns,
+    return {"calls": calls, "params": params, "build": build, "consent": {},
+            "regions": {"p4": (0, 0x20000), "c6": (0, 0x20000)}, "tmp": tmp_path, "campaigns": campaigns,
             "boards": {k: Board(k, calls, params[k]) for k in ("p4", "c6")},
             "orchestrators": {k: Orchestrator(k, calls, tmp_path) for k in ("p4", "c6")}}
 
@@ -126,7 +134,8 @@ class FakeConsole:
 def go(world, scenarios, script=None):
     FakeConsole.script = script or {}
     FakeConsole.raw = bytearray()
-    return flow.run(world["params"], scenarios, world["build"], world["tmp"], world["campaigns"],
+    return flow.run(world["params"], world["consent"], scenarios, world["regions"], world["build"],
+                    world["tmp"], world["campaigns"],
                     world["orchestrators"], world["boards"], FakeConsole, lambda label: None,
                     sleep=lambda s: None, clock=iter(range(0, 1000, 5)).__next__)
 
@@ -144,17 +153,43 @@ def test_c6_backup_mismatch_blocks_everything_and_restores_nothing(world):
     assert all(c.closed for c in world["campaigns"].values())
 
 
-def test_data_partition_is_refused_before_any_backup(world):
-    world["boards"]["p4"].table = [dict(TABLE[0], type=1)]
+def test_valid_existing_table_is_not_overwritten_without_consent(world):
+    world["boards"]["p4"].existing = [{"address": 0x9000, "type": 1, "size": 0x6000}]
     outcome = go(world, ["h1"])
-    assert isinstance(outcome.error, inputs.InputError)
-    assert kinds(world) == []
+    assert isinstance(outcome.error, inputs.InputError) and "allow_overwrite_valid_table" in str(outcome.error)
+    assert "program" not in kinds(world)
 
 
-def test_partition_overflow_is_refused_before_any_backup(world):
-    world["params"]["p4"]["app_size"] = 0x200000
+def test_valid_existing_table_with_consent_is_backed_up_then_overwritten(world):
+    world["boards"]["p4"].existing = [{"address": 0x9000, "type": 1, "size": 0x6000}]
+    world["consent"]["allow_overwrite_valid_table"] = True
     outcome = go(world, ["h1"])
-    assert isinstance(outcome.error, inputs.InputError) and kinds(world) == []
+    assert ("backup", "p4", inputs.RESTORE_TIMEOUT) in world["calls"]
+    assert world["calls"].index(("backup", "p4", inputs.RESTORE_TIMEOUT)) < kinds(world).index("program")
+    assert outcome.error is None or not isinstance(outcome.error, inputs.InputError)
+
+
+def test_blank_flash_is_accepted_and_both_regions_are_backed_up_twice(world):
+    go(world, ["h1"])
+    assert [c[1] for c in world["calls"] if c[0] == "backup"].count("p4") == 2
+    assert [c[1] for c in world["calls"] if c[0] == "backup"].count("c6") == 2
+
+
+def test_written_table_mismatch_stops_and_restores(world):
+    world["boards"]["c6"].written = []
+    outcome = go(world, ["h1"])
+    assert isinstance(outcome.error, inputs.InputError) and "differs from the image" in str(outcome.error)
+    assert not any(c[0] == "program" and c[1] == "p4" for c in world["calls"])
+    assert ("restore", "c6") in world["calls"]
+
+
+def test_unexpected_partition_read_error_is_not_taken_for_a_blank_flash(world):
+    def broken():
+        raise RuntimeError("serial_timeout")
+
+    world["boards"]["p4"].partitions = broken
+    outcome = go(world, ["h1"])
+    assert isinstance(outcome.error, RuntimeError) and "program" not in kinds(world)
 
 
 def test_first_failing_scenario_stops_programming_and_restores_programmed_boards(world):
@@ -187,7 +222,7 @@ def test_grant_budget_is_requested_for_programming_and_restoration(world):
 
 def test_historical_backup_divergence_blocks_before_programming(world, tmp_path):
     path = tmp_path / "hist.bin"
-    path.write_bytes(b"\0" * 0x110000 + b"\3" * 16 + b"\0" * 0x100000)
+    path.write_bytes(b"\3" * 0x20000)
     world["params"]["p4"]["historical_backup"] = {"path": str(path),
                                                   "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     outcome = go(world, ["h1"])
@@ -219,7 +254,8 @@ class ScriptedConsole:
 def go_scripted(world, scenario, chunks, fail_at=None):
     ScriptedConsole.chunks, ScriptedConsole.fail_at = chunks, fail_at
     world["params"]["scenario_timeout_seconds"] = 100
-    return flow.run(world["params"], [scenario], world["build"], world["tmp"], world["campaigns"],
+    return flow.run(world["params"], world["consent"], [scenario], world["regions"], world["build"],
+                    world["tmp"], world["campaigns"],
                     world["orchestrators"], world["boards"], ScriptedConsole, lambda label: None,
                     sleep=lambda s: None, clock=iter(range(0, 10000, 1)).__next__)
 

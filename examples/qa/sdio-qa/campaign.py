@@ -3,9 +3,11 @@
 The pytest recipe passes the real `Campaign`, `Orchestrator` and `Board` objects. The software
 tests pass doubles, which is how the safeguards below are demonstrated without hardware:
 
-* the programmed region must be exactly an application partition of the observed table;
-* nothing is written unless both boards have two identical backups (and a configured
-  historical backup matches);
+* the programmed region is computed from the full images (bootloader, table, application at
+  flash address 0); a valid table already on the board is never overwritten without the
+  operator's explicit consent, and after programming the table read back must be the image's;
+* nothing is written unless both boards have two identical backups of that region (and a
+  configured historical backup matches);
 * a board is restored only if a mutation was engaged on it;
 * the campaign stops at the first scenario that is not PASS, before any further programming;
 * every operation is preceded by a grant and reservation sized for `Orchestrator.program()`.
@@ -69,34 +71,40 @@ class Outcome:
         return not (self.error or self.cleanup_errors or self.failed_verdicts)
 
 
-def _prepare(key, params, boards, campaigns, orchestrators, outcome):
+def _prepare(key, params, consent, regions, boards, campaigns, orchestrators, outcome):
     """H0 identification and backups for one board. No write happens here."""
     board, spec = boards[key], params[key]
+    address, size = regions[key]
     identity = board.identify()
     campaigns[key].write("h0-identify.json", {k: identity.get(k) for k in ("chip", "flash_size")})
     if identity["chip"] != spec["chip"] or identity["flash_size"] != spec["flash_size"]:
         raise inputs.InputError(f"{key}: observed identity differs from the parameters")
-    table = board.partitions()
-    campaigns[key].write("h0-partitions.json", table)
-    inputs.check_partition(table, spec)
+    try:
+        table = board.partitions()
+    except Exception as error:  # noqa: BLE001 - a blank or erased flash has no valid table
+        if "partition_table_invalid" not in str(error):
+            raise
+        table = None
+    campaigns[key].write("h0-existing-partitions.json", {"valid_table": table is not None,
+                                                         "table": table})
+    inputs.check_existing_table(table, consent)
     reads = []
     for name in ("backup-a.bin", "backup-b.bin"):
-        path, meta = orchestrators[key].backup(board, address=spec["app_offset"], size=spec["app_size"],
-                                               filename=name, timeout=inputs.RESTORE_TIMEOUT)
+        path, meta = orchestrators[key].backup(board, address=address, size=size, filename=name,
+                                               timeout=inputs.RESTORE_TIMEOUT)
         reads.append((path, meta))
     if reads[0][1]["sha256"] != reads[1][1]["sha256"]:
-        raise inputs.InputError(f"{key}: two reads of the app partition differ; no write allowed")
+        raise inputs.InputError(f"{key}: two reads of the region differ; no write allowed")
     outcome.backups[key] = reads[0][0]
     history = spec.get("historical_backup")
     if history:
         data = Path(history["path"]).read_bytes()
-        inputs.check_historical(history, data, Path(reads[0][0]).read_bytes(),
-                                spec["app_offset"], spec["app_size"])
+        inputs.check_historical(history, data, Path(reads[0][0]).read_bytes(), address, size)
         campaigns[key].write("h0-historical-crosscheck.json", {"matches_fresh_backup": True})
 
 
-def _program(key, scenario, role, params, build, build_dir, boards, campaigns, orchestrators,
-             gesture, outcome, ttl):
+def _program(key, scenario, role, params, regions, build, build_dir, boards, campaigns,
+             orchestrators, gesture, outcome, ttl):
     row = next(r for r in build["artifacts"] if r["scenario"] == scenario and r["role"] == role)
     gesture(f"{scenario}: put the {key.upper()} in loader mode as declared; "
             "keep the P4 in reset while the C6 is loaded")
@@ -104,12 +112,16 @@ def _program(key, scenario, role, params, build, build_dir, boards, campaigns, o
     orchestrators[key].wait_ready(timeout=300, grant_seconds=need)
     boards[key].renew(ttl=ttl)
     outcome.mutated.add(key)  # engaged before the call: an uncertain write still needs restoring
-    orchestrators[key].program(boards[key], address=params[key]["app_offset"],
+    orchestrators[key].program(boards[key], address=row["layout"]["write_address"],
                                source=Path(build_dir) / row["image"], sha256=row["image_sha256"],
                                allow_destructive=True, timeout=inputs.PROGRAM_TIMEOUT)
+    # The independent readback above covers every byte; the table is read as extra evidence.
+    inputs.check_written_table(boards[key].partitions(), row["layout"])
     campaigns[key].write(f"h0-program-{scenario}.json", {
         "image_sha256": row["image_sha256"], "elf_sha256": row["elf_sha256"],
-        "address": params[key]["app_offset"], "readback": "independent flash.read equal"})
+        "address": row["layout"]["write_address"], "size": row["image_size"],
+        "layout": row["layout"], "readback": "independent flash.read equal",
+        "table_readback": "equals the image's table"})
 
 
 def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, clock):
@@ -165,24 +177,24 @@ def _cleanup(params, boards, campaigns, orchestrators, gesture, outcome, ttl):
             outcome.cleanup_errors.append((key, type(error).__name__))
 
 
-def run(params, scenarios, build, build_dir, campaigns, orchestrators, boards, make_console,
-        gesture, *, ttl=1800, sleep=time.sleep, clock=time.monotonic):
+def run(params, consent, scenarios, regions, build, build_dir, campaigns, orchestrators, boards,
+        make_console, gesture, *, ttl=1800, sleep=time.sleep, clock=time.monotonic):
     outcome = Outcome()
     interrupted = None
     try:
         for key in ("p4", "c6"):
-            _prepare(key, params, boards, campaigns, orchestrators, outcome)
+            _prepare(key, params, consent, regions, boards, campaigns, orchestrators, outcome)
         for scenario in scenarios:
             for key, role in (("c6", "slave"), ("p4", "host")):
-                _program(key, scenario, role, params, build, build_dir, boards, campaigns,
-                         orchestrators, gesture, outcome, ttl)
+                _program(key, scenario, role, params, regions, build, build_dir, boards,
+                         campaigns, orchestrators, gesture, outcome, ttl)
             lines = _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, clock)
             for test_id, result in verdict.evaluate(scenario, lines).items():
                 outcome.verdicts[test_id] = result
                 campaigns["p4"].result(test_id, result.status,
                                        preconditions=f"build {params['expected_source_sha']}",
                                        evidence=str(result.checks)[:2000], incidents="",
-                                       restoration="pending", limits="app partitions only")
+                                       restoration="pending", limits="flash prefix covered by the images only")
             if outcome.failed_verdicts:
                 break  # keep the evidence, program nothing more, then clean up
     except (KeyboardInterrupt, SystemExit) as error:

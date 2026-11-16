@@ -29,12 +29,19 @@ One firmware pair per scenario, selected at build time:
 ```sh
 SDIO_QA_SCENARIO=h4 cargo xtask build sdio-qa-slave esp32c6
 SDIO_QA_SCENARIO=h4 cargo xtask build sdio-qa-host esp32p4
-python examples/qa/sdio-qa/build.py --base <qualified base SHA> --output <new private dir>
+python examples/qa/sdio-qa/build.py --base <qualified base SHA> --output <new private dir> \
+  --p4-flash-size 32mb --c6-flash-size 8mb   # the verified capacities of the two boards
 ```
 
 Scenarios: `h1`, `h2`, `h3`, `h4`, `h567` (H5, H6 and H7 form one ordered sequence because H7
-resynchronizes after H5 and H6). The app image is made from the ELF by `espflash save-image`
-without `--merge`: no bootloader and no partition table is ever produced or written.
+resynchronizes after H5 and H6). Each image is a
+**full flash-prefix image** made from the ELF by `espflash save-image --merge --skip-padding`:
+it starts at flash address 0 and holds the second-stage bootloader (bundled with espflash,
+ESP-IDF v6.1-dev, offset 0x0 on the C6 and 0x2000 on the P4), the partition table at 0x8000
+(`nvs`, `phy_init`, `factory` at 0x10000) and the application. Nothing is padded to the flash
+size. `image_layout.py` parses the image and the manifest records its layout; the P4 images
+require chip revision 3.00 or later. **Writing a bootloader and a partition table needs the
+operator's distinct, explicit consent** (`write_bootloader_and_partition_table`).
 The manifest records the source SHA, the proof that production sources are unchanged, the
 `esp-hal` package path Cargo resolved (a local path, never the registry), the command, the
 target, and the SHA-256 of every ELF and image.
@@ -66,11 +73,11 @@ fresh `SdioSlave::new` does not reset).
 ## Scenario contracts
 
 Common effects: the P4 firmware holds the C6 in reset at boot, then releases it; a P4 reset
-therefore starts a fresh C6 session. Only the app partitions are written.
+therefore starts a fresh C6 session. Only the flash prefix covered by the images is written (the largest scenario image of a board sets its region, rounded to whole sectors); the flash is never erased as a whole.
 
 | ID | Objective | Assertions (both firmwares check, `verdict.py` re-checks from the logs) |
 | --- | --- | --- |
-| H0 | Identify, back up, program | Chip and flash size equal the parameters; the region is exactly one application partition (type 0, same address and size, no overlap) of the observed table; two reads of each app partition are identical and, if configured, match the historical backup, otherwise no write; programming has an independent `flash.read` equal to the image; no erase. |
+| H0 | Identify, back up, program | Chip and flash size equal the parameters; the existing table is recorded (blank or erased flash yields no valid table and is accepted; a valid table is never overwritten without `allow_overwrite_valid_table`); two reads of the region to write are identical and, if configured, match the historical backup, otherwise no write; programming has an independent `flash.read` equal to the full image, then the table read from the board must equal the image's table; no erase. |
 | H1 | 64-byte round trip, three fresh sessions | Enumeration; P4->C6 and C6->P4 payloads compared byte for byte on both sides (`0..63` ramp, echoed as in the public example); credit 1 and length 64 in every session; three C6 reboots. |
 | H2 | Reuse in one session | Three round trips without reset or re-enumeration; the pattern changes with every packet and the response is independent of the request; credits 1,2,3 and cumulative length 64,128,192; host consumed exactly 64 bytes and one credit per round; no credit appears without a re-armed resource; state returns to `BusExposed` between directions. |
 | H3 | 65-byte C6 -> P4 | Allocation of 128 bytes, exactly 65 published and read with a CMD53 of count 65; length announced 65, received 65, each byte compared; bytes past the word-rounded length are observed. |
@@ -147,8 +154,10 @@ project owner for the campaign. A PR, a green CI or a pytest opt-in is not that 
    bridge at 115200; declare which in `transports`. After programming, a reset is a manual
    gesture (no `reset` capability on that port). Both application consoles are 115200 baud
    (`esp-println` is silent until UART0 is initialised, which both firmwares do).
-4. The app partition offset and size of each board from the observed `partitions` result (the
-   factory P4 layout has its app at 0x110000; confirm, do not assume). Nothing else is written.
+4. The existing flash state of each board, from `identify` and `partitions`: a blank or erased
+   flash has no valid table (observed on the P4 on 2026-11-16, not proof that it is blank); if
+   a valid table exists the operator decides whether it may be overwritten (backed up and restored
+   by the campaign). Nothing outside the image prefix is written.
 5. Private files outside Git: parameters, consent, evidence root on verified persistent
    storage, `BENCH_CLIENT_TOKEN` in the process environment, a local grant for each programming
    operation (revoked afterwards), and enough reservation time for programming and readback.

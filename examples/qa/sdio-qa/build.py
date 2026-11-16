@@ -7,9 +7,11 @@ Run from the repository root:
 
 Each scenario produces an ESP32-P4 host and an ESP32-C6 slave built by `cargo xtask build`
 with `SDIO_QA_SCENARIO` set. The app image is produced from the ELF with
-`espflash save-image` WITHOUT `--merge`: only the application image is written, never a
-bootloader or a partition table. This script never opens a serial port and never programs a
-board.
+`espflash save-image --merge --skip-padding`: a FULL flash-prefix image that starts at flash
+address 0 and holds the second-stage bootloader, the partition table and the application. The
+bootloader and the table are the ones bundled with espflash, never a custom or erased one, and
+nothing is padded to the flash size. This script never opens a serial port and never programs
+a board; writing a bootloader and partition table needs the operator's distinct consent.
 
 The manifest records the source SHA, the working-tree state, the proof that the production
 driver sources are unchanged from the qualified base, the esp-hal path actually resolved by
@@ -24,6 +26,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+import importlib.util
 
 SCENARIOS = ("h1", "h2", "h3", "h4", "h567")
 FIRMWARE = {
@@ -36,6 +39,14 @@ PRODUCTION_PATHS = [
     "esp-backtrace", "esp-bootloader-esp-idf", "esp-rtos", "esp-sync", "esp-riscv-rt",
     "esp-rom-sys",
 ]
+
+
+def _layout_module():
+    spec = importlib.util.spec_from_file_location("sdio_qa_image_layout",
+                                                  Path(__file__).with_name("image_layout.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def run(command, cwd, env=None, check=True):
@@ -69,6 +80,8 @@ def main():
                         help="new private directory for the artifacts (must not exist)")
     parser.add_argument("--base", required=True,
                         help="qualified SDIO commit the production driver must still match")
+    parser.add_argument("--p4-flash-size", required=True, help="verified flash size, e.g. 32mb")
+    parser.add_argument("--c6-flash-size", required=True, help="verified flash size, e.g. 8mb")
     parser.add_argument("--scenarios", nargs="+", default=list(SCENARIOS), choices=SCENARIOS)
     args = parser.parse_args()
     root = Path(run(["git", "rev-parse", "--show-toplevel"], Path.cwd()).stdout.strip())
@@ -104,14 +117,18 @@ def main():
             elf = folder / f"{spec['bin']}-{scenario}.elf"
             image = folder / f"{spec['bin']}-{scenario}.bin"
             shutil.copy2(built, elf)
-            run(["espflash", "save-image", "--chip", spec["chip"], "--skip-update-check",
-                 str(elf), str(image)], root)
+            flash_size = args.p4_flash_size if role == "host" else args.c6_flash_size
+            run(["espflash", "save-image", "--chip", spec["chip"], "--merge", "--skip-padding",
+                 "--flash-size", flash_size, "--skip-update-check", str(elf), str(image)], root)
+            layout = _layout_module().parse(image.read_bytes(), spec["chip"])
             manifest["artifacts"].append({
                 "scenario": scenario, "role": role, "chip": spec["chip"],
                 "target": spec["target"], "scenario_env": f"SDIO_QA_SCENARIO={scenario}",
                 "command": " ".join(command), "elf": str(elf.relative_to(args.output)),
                 "elf_sha256": sha256(elf), "image": str(image.relative_to(args.output)),
+                "image_kind": "full-flash-prefix", "flash_size_arg": flash_size,
                 "image_sha256": sha256(image), "image_size": image.stat().st_size,
+                "layout": layout,
                 "esp_hal": esp_hal_resolution(root, spec["chip"], spec["target"]),
             })
             print(f"built {scenario}/{role}: {manifest['artifacts'][-1]['image_sha256']}")

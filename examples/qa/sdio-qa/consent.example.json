@@ -1,8 +1,18 @@
 {
-  "_comment": "Written by the operator after reviewing the exact commit. The assistant never writes this file.",
+  "_comment": "Written by the operator after reviewing the exact commit and, if any, the valid partition table already on a board (then also set allow_overwrite_valid_table). The assistant never writes this file.",
   "commit": "<reviewed commit SHA>",
-  "boards": ["<p4 device id>", "<c6 device id>"],
-  "scenarios": ["h1", "h2", "h3", "h4", "h567"],
-  "effects": "Write the app partition of both boards; reset sequences; GPIO54 driven by the P4 firmware; no full erase, no eFuse, no bootloader or partition-table write.",
-  "operator_statement": "<the operator's own words, with date>"
+  "boards": [
+    "<p4 device id>",
+    "<c6 device id>"
+  ],
+  "scenarios": [
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h567"
+  ],
+  "effects": "Write a full flash-prefix image (bootloader, partition table, application) at address 0 of both boards, region computed from the images; reset sequences; GPIO54 driven by the P4 firmware; no full erase, no eFuse change.",
+  "operator_statement": "<the operator's own words, with date>",
+  "write_bootloader_and_partition_table": false
 }

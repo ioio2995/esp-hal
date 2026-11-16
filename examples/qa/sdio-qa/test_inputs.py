@@ -1,16 +1,23 @@
-"""Software-only tests of the input validation: templates and mismatches are refused."""
+"""Software-only tests of the input validation: templates, unreviewed builds and missing
+bootloader consent are refused."""
 import copy
 import hashlib
 import importlib.util
-import json
 from pathlib import Path
 
 import pytest
 
-spec = importlib.util.spec_from_file_location("sdio_qa_inputs", Path(__file__).with_name("inputs.py"))
-inputs = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(inputs)
+HERE = Path(__file__).parent
 
+
+def load(name):
+    spec = importlib.util.spec_from_file_location("ti_" + name, HERE / (name + ".py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+inputs, fake, layout = load("inputs"), load("fake_image"), load("image_layout")
 SHA = "a" * 40
 
 
@@ -21,26 +28,30 @@ def case(tmp_path):
         for role, chip in (("host", "esp32p4"), ("slave", "esp32c6")):
             image = tmp_path / scenario / f"{role}.bin"
             image.parent.mkdir(exist_ok=True)
-            image.write_bytes(b"image-" + role.encode() + scenario.encode())
+            image.write_bytes(fake.make(chip, app_bytes=8192 if scenario != "h1" else 4096))
             artifacts.append({"scenario": scenario, "role": role, "chip": chip,
                               "image": f"{scenario}/{role}.bin", "elf_sha256": "0" * 64,
+                              "image_kind": "full-flash-prefix",
                               "image_sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
                               "image_size": image.stat().st_size,
+                              "layout": layout.parse(image.read_bytes(), chip),
                               "esp_hal": {"manifest_path": "/w/esp-hal/Cargo.toml", "registry_source": None}})
     build = {"source_sha": SHA, "production_driver_unchanged_from_base": True, "artifacts": artifacts}
     params = {"expected_source_sha": SHA,
-              "p4": {"device": "board-p4", "chip": "esp32p4", "flash_size": 1 << 25,
-                     "transports": ["external_uart"], "app_offset": 0x110000, "app_size": 0x100000},
-              "c6": {"device": "board-c6", "chip": "esp32c6", "flash_size": 1 << 22,
-                     "transports": ["external_uart"], "app_offset": 0x10000, "app_size": 0x100000}}
-    consent = {"commit": SHA, "boards": ["board-p4", "board-c6"], "scenarios": ["h1", "h567"],
-               "effects": "app partition writes", "operator_statement": "approved by the operator"}
+              "p4": {"device": "board-p4", "chip": "esp32p4", "flash_size": 1 << 25, "transports": ["external_uart"]},
+              "c6": {"device": "board-c6", "chip": "esp32c6", "flash_size": 1 << 23, "transports": ["external_uart"]}}
+    consent = {"commit": SHA, "boards": ["board-p4", "board-c6"], "scenarios": ["h1", "h2", "h567"],
+               "effects": "full flash-prefix image writes", "write_bootloader_and_partition_table": True,
+               "operator_statement": "approved by the operator"}
     return params, consent, build, tmp_path
 
 
-def test_valid_inputs_return_the_consented_scenarios(case):
+def test_valid_inputs_return_scenarios_and_regions_from_the_images(case):
     params, consent, build, directory = case
-    assert inputs.validate(params, consent, build, directory) == ["h1", "h567"]
+    scenarios, regions = inputs.validate(params, consent, build, directory)
+    assert scenarios == ["h1", "h2", "h567"]
+    assert regions["c6"][0] == 0 and regions["c6"][1] % 4096 == 0
+    assert regions["p4"][1] >= 0x10000 + 8192  # the largest scenario image sets the region
 
 
 @pytest.mark.parametrize("mutate,message", [
@@ -48,12 +59,15 @@ def test_valid_inputs_return_the_consented_scenarios(case):
     (lambda p, c, b: b.update(production_driver_unchanged_from_base=False), "production driver"),
     (lambda p, c, b: p["p4"].update(device="<logical id>"), "placeholder"),
     (lambda p, c, b: p["c6"].update(flash_size=0), "verified identify"),
-    (lambda p, c, b: p["c6"].update(app_offset=0), "sector-aligned"),
     (lambda p, c, b: c.update(operator_statement="<the operator's own words>"), "written by the operator"),
     (lambda p, c, b: c.update(boards=["board-p4"]), "exactly the two boards"),
     (lambda p, c, b: c.update(scenarios=["h9"]), "known scenarios"),
     (lambda p, c, b: p["c6"].update(device="board-p4"), "distinct"),
     (lambda p, c, b: b["artifacts"][0]["esp_hal"].update(registry_source="registry+https://x"), "local esp-hal"),
+    (lambda p, c, b: c.update(write_bootloader_and_partition_table=False), "bootloader"),
+    (lambda p, c, b: c.pop("write_bootloader_and_partition_table"), "bootloader"),
+    (lambda p, c, b: b["artifacts"][0].update(image_kind="app-only"), "full flash-prefix"),
+    (lambda p, c, b: p["c6"].update(flash_size=4096), "out of bounds"),
 ])
 def test_refusals(case, mutate, message):
     params, consent, build, directory = (copy.deepcopy(x) if not isinstance(x, Path) else x for x in case)
@@ -69,40 +83,11 @@ def test_modified_image_is_refused(case):
         inputs.validate(params, consent, build, directory)
 
 
-def test_image_larger_than_partition_is_refused(case):
+def test_layout_differing_from_the_manifest_is_refused(case):
     params, consent, build, directory = case
-    params["c6"]["app_size"] = 4096
-    big = directory / "h1" / "slave.bin"
-    big.write_bytes(b"x" * 8192)
-    row = next(a for a in build["artifacts"] if a["scenario"] == "h1" and a["role"] == "slave")
-    row["image_sha256"], row["image_size"] = hashlib.sha256(big.read_bytes()).hexdigest(), 8192
-    with pytest.raises(inputs.InputError, match="does not fit"):
+    build["artifacts"][0]["layout"]["app"]["size"] += 4096
+    with pytest.raises(inputs.InputError, match="layout differs"):
         inputs.validate(params, consent, build, directory)
-
-
-TABLE = [
-    {"label": "nvs", "type": 1, "subtype": 2, "address": 0x9000, "size": 0x6000},
-    {"label": "factory", "type": 0, "subtype": 0, "address": 0x110000, "size": 0x100000},
-    {"label": "storage", "type": 1, "subtype": 1, "address": 0x210000, "size": 0x100000},
-]
-SPEC = {"app_offset": 0x110000, "app_size": 0x100000}
-
-
-def test_exact_app_partition_is_accepted():
-    assert inputs.check_partition(TABLE, SPEC)["label"] == "factory"
-
-
-@pytest.mark.parametrize("spec,table,message", [
-    ({"app_offset": 0x210000, "app_size": 0x100000}, TABLE, "not an application"),
-    ({"app_offset": 0x110000, "app_size": 0x200000}, TABLE, "differs from the observed"),
-    ({"app_offset": 0x111000, "app_size": 0x1000}, TABLE, "no single partition"),
-    (SPEC, TABLE[:1] + [{"label": "f", "type": 0, "subtype": 0, "address": 0x110000, "size": 0x100000},
-                        {"label": "o", "type": 1, "subtype": 1, "address": 0x1ff000, "size": 0x2000}],
-     "overlaps"),
-])
-def test_wrong_partition_or_overflow_is_refused(spec, table, message):
-    with pytest.raises(inputs.InputError, match=message):
-        inputs.check_partition(table, spec)
 
 
 def test_grant_must_cover_a_restoration(case):
@@ -115,11 +100,28 @@ def test_grant_must_cover_a_restoration(case):
     assert inputs.budget(600) == 1290  # the Orchestrator default that 900 s cannot satisfy
 
 
+def test_existing_valid_table_needs_explicit_acceptance():
+    inputs.check_existing_table(None, {})  # blank or erased flash: nothing to accept
+    table = [{"address": 0x9000, "type": 1, "size": 0x6000}]
+    with pytest.raises(inputs.InputError, match="allow_overwrite_valid_table"):
+        inputs.check_existing_table(table, {})
+    inputs.check_existing_table(table, {"allow_overwrite_valid_table": True})
+
+
+def test_written_table_must_equal_the_image_table(case):
+    _, _, build, _ = case
+    row = build["artifacts"][0]
+    inputs.check_written_table([{k: p[k] for k in ("address", "type", "size")} for p in row["layout"]["partitions"]],
+                               row["layout"])
+    with pytest.raises(inputs.InputError, match="differs from the image"):
+        inputs.check_written_table([], row["layout"])
+
+
 def test_historical_backup_divergence_blocks():
     data = bytes(range(256)) * 32
     declared = {"sha256": hashlib.sha256(data).hexdigest()}
-    inputs.check_historical(declared, data, data[4096:8192], 4096, 4096)
+    inputs.check_historical(declared, data, data[0:4096], 0, 4096)
     with pytest.raises(inputs.InputError, match="differs from the fresh"):
-        inputs.check_historical(declared, data, b"\0" * 4096, 4096, 4096)
+        inputs.check_historical(declared, data, b"\0" * 4096, 0, 4096)
     with pytest.raises(inputs.InputError, match="declared SHA-256"):
-        inputs.check_historical({"sha256": "0" * 64}, data, data[4096:8192], 4096, 4096)
+        inputs.check_historical({"sha256": "0" * 64}, data, data[0:4096], 0, 4096)
