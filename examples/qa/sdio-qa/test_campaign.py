@@ -141,6 +141,10 @@ def go(world, scenarios, script=None):
                     sleep=lambda s: None, clock=iter(range(0, 1000, 5)).__next__)
 
 
+def p4_written(world):
+    return [c for c in world["calls"] if c[0] == "program" and c[1] == "p4"]
+
+
 def kinds(world):
     return [c[0] for c in world["calls"]]
 
@@ -158,7 +162,7 @@ def test_valid_existing_table_is_not_overwritten_without_consent(world):
     world["boards"]["p4"].existing = [{"address": 0x9000, "type": 1, "size": 0x6000}]
     outcome = go(world, ["h1"])
     assert isinstance(outcome.error, inputs.InputError) and "allow_overwrite_valid_table" in str(outcome.error)
-    assert "program" not in kinds(world)
+    assert not p4_written(world) and ("backup", "p4", inputs.RESTORE_TIMEOUT) not in world["calls"]
 
 
 def test_valid_existing_table_with_consent_is_backed_up_then_overwritten(world):
@@ -166,7 +170,8 @@ def test_valid_existing_table_with_consent_is_backed_up_then_overwritten(world):
     world["consent"]["allow_overwrite_valid_table"] = True
     outcome = go(world, ["h1"])
     assert ("backup", "p4", inputs.RESTORE_TIMEOUT) in world["calls"]
-    assert world["calls"].index(("backup", "p4", inputs.RESTORE_TIMEOUT)) < kinds(world).index("program")
+    first_p4_backup = world["calls"].index(("backup", "p4", inputs.RESTORE_TIMEOUT))
+    assert first_p4_backup < world["calls"].index(("program", "p4", "h1-host.bin"))
     assert outcome.error is None or not isinstance(outcome.error, inputs.InputError)
 
 
@@ -190,7 +195,7 @@ def test_unexpected_partition_read_error_is_not_taken_for_a_blank_flash(world):
 
     world["boards"]["p4"].partitions = broken
     outcome = go(world, ["h1"])
-    assert isinstance(outcome.error, RuntimeError) and "program" not in kinds(world)
+    assert isinstance(outcome.error, RuntimeError) and not p4_written(world)
 
 
 def test_first_failing_scenario_stops_programming_and_restores_programmed_boards(world):
@@ -227,7 +232,7 @@ def test_historical_backup_divergence_blocks_before_programming(world, tmp_path)
     world["params"]["p4"]["historical_backup"] = {"path": str(path),
                                                   "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     outcome = go(world, ["h1"])
-    assert isinstance(outcome.error, inputs.InputError) and "program" not in kinds(world)
+    assert isinstance(outcome.error, inputs.InputError) and not p4_written(world)
 
 
 class ScriptedConsole:
@@ -281,13 +286,24 @@ def test_h1_collection_waits_for_the_third_c6_session(world):
     assert outcome.error is None
 
 
-def test_no_p4_operation_between_c6_preparation_and_c6_programming(world):
+def test_c6_is_fully_handled_before_any_p4_operation(world):
     go(world, ["h1"])
     calls = world["calls"]
-    first_c6 = next(i for i, c in enumerate(calls) if c[:2] == ("backup", "c6"))
-    program_c6 = next(i for i, c in enumerate(calls) if c[:2] == ("program", "c6"))
-    assert not [c for c in calls[first_c6:program_c6] if len(c) > 1 and c[1] == "p4"]
-    # the operator is asked to put the C6 in download after the P4 backups, before the C6 ones
-    last_p4_backup = max(i for i, c in enumerate(calls) if c[:2] == ("backup", "p4"))
-    gesture = next(i for i, c in enumerate(calls) if c[0] == "gesture" and "C6 in ROM download" in c[1])
-    assert last_p4_backup < gesture < first_c6
+    ops = [c for c in calls if c[0] in {"backup", "program", "restore", "compare"}]
+    first_p4 = next(i for i, c in enumerate(ops) if c[1] == "p4")
+    c6_before = [c for c in ops[:first_p4] if c[1] == "c6"]
+    assert [c[0] for c in c6_before] == ["backup", "backup", "program"]
+    assert not [c for c in ops[:first_p4] if c[1] == "p4"]
+    # one gesture for the C6 before its preparation, and none repeated before its first write
+    gestures = [c[1] for c in calls[:next(i for i, c in enumerate(calls) if c[0] == "program")]
+                if c[0] == "gesture"]
+    assert len(gestures) == 1 and "C6 in ROM download" in gestures[0]
+
+
+def test_each_board_is_written_only_after_its_own_two_identical_backups(world):
+    world["orchestrators"]["p4"].differ = True
+    outcome = go(world, ["h1"])
+    assert isinstance(outcome.error, inputs.InputError)
+    assert ("program", "c6", "h1-slave.bin") in world["calls"]  # the C6 phase was complete
+    assert not [c for c in world["calls"] if c[0] == "program" and c[1] == "p4"]
+    assert ("restore", "c6") in world["calls"] and ("restore", "p4") not in world["calls"]

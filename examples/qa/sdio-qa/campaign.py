@@ -6,9 +6,9 @@ tests pass doubles, which is how the safeguards below are demonstrated without h
 * the programmed region is computed from the full images (bootloader, table, application at
   flash address 0); a valid table already on the board is never overwritten without the
   operator's explicit consent, and after programming the table read back must be the image's;
-* the C6 is prepared and programmed with no P4 operation in between (its EN pin is wired to a
-  P4 GPIO, so a P4 reset reboots it out of download mode);
-* nothing is written unless both boards have two identical backups of that region (and a
+* every C6 operation (identify, two backups, programming, table check) comes first and in one
+  go; the P4 is touched only afterwards, because its GPIO reboots the C6 out of download mode;
+* a board is written only after its own two identical backups of that region (and a
   configured historical backup matches);
 * a board is restored only if a mutation was engaged on it;
 * the campaign stops at the first scenario that is not PASS, before any further programming;
@@ -106,10 +106,11 @@ def _prepare(key, params, consent, regions, boards, campaigns, orchestrators, ou
 
 
 def _program(key, scenario, role, params, regions, build, build_dir, boards, campaigns,
-             orchestrators, gesture, outcome, ttl):
+             orchestrators, gesture, outcome, ttl, ask=True):
     row = next(r for r in build["artifacts"] if r["scenario"] == scenario and r["role"] == role)
-    gesture(f"{scenario}: put the {key.upper()} in loader mode as declared; "
-            "keep the P4 in reset while the C6 is loaded")
+    if ask:  # right after its own preparation a board is already in loader mode
+        gesture(f"{scenario}: put the {key.upper()} in loader mode as declared; "
+                "do not reset the C6 before its programming is finished")
     need = inputs.budget(inputs.PROGRAM_TIMEOUT)
     orchestrators[key].wait_ready(timeout=300, grant_seconds=need)
     boards[key].renew(ttl=ttl)
@@ -184,18 +185,23 @@ def run(params, consent, scenarios, regions, build, build_dir, campaigns, orches
     outcome = Outcome()
     interrupted = None
     try:
-        _prepare("p4", params, consent, regions, boards, campaigns, orchestrators, outcome)
-        # The C6 EN pin is wired to a P4 GPIO: any P4 operation or reset can reboot the C6 and
-        # take it out of ROM download. The C6 is therefore identified, backed up and (below)
-        # programmed first thing after the operator puts it in download, with no P4 operation
-        # in between.
-        gesture("put the C6 in ROM download now and do not touch the P4 until the C6 is "
-                "programmed: a P4 reset reboots the C6 through EN")
-        _prepare("c6", params, consent, regions, boards, campaigns, orchestrators, outcome)
+        # The C6 EN pin is wired to a P4 GPIO: any P4 operation or reset reboots the C6 and takes
+        # it out of ROM download. Every C6 operation therefore comes first and in one go
+        # (identify, two backups, programming, table check); the P4 is only touched afterwards,
+        # and the C6 is not reset before the end of its phase.
+        prepared = set()
         for scenario in scenarios:
             for key, role in (("c6", "slave"), ("p4", "host")):
+                fresh = key not in prepared
+                if fresh:
+                    if key == "c6":
+                        gesture("put the C6 in ROM download now; do not touch the P4 until the C6 "
+                                "is programmed: a P4 reset reboots the C6 through EN")
+                    _prepare(key, params, consent, regions, boards, campaigns, orchestrators,
+                             outcome)
+                    prepared.add(key)
                 _program(key, scenario, role, params, regions, build, build_dir, boards,
-                         campaigns, orchestrators, gesture, outcome, ttl)
+                         campaigns, orchestrators, gesture, outcome, ttl, ask=not fresh)
             lines = _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, clock)
             for test_id, result in verdict.evaluate(scenario, lines).items():
                 outcome.verdicts[test_id] = result

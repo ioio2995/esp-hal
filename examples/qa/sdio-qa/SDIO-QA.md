@@ -122,12 +122,12 @@ and unobservable properties are reported separately.
 
 ## Campaign safeguards
 
-* The C6 EN pin is wired to a P4 GPIO: a P4 operation or reset can reboot the C6 and take it
-  out of ROM download. The recipe therefore prepares the P4 first, asks the operator to put the
-  C6 in download, then identifies, backs up and programs the C6 with no P4 operation in between.
-  Do not probe the C6 beforehand, and run with `--sdio-qa-interactive` so that every gesture is
-  awaited.
-
+* The C6 EN pin is wired to a P4 GPIO, and the operator reaches the C6 only through that
+  arrangement: any P4 operation or reset reboots the C6 and takes it out of ROM download. The
+  recipe therefore does everything on the C6 first and in one go (identify, two backups,
+  programming, table check), asks for one gesture to put the C6 in download, and only then
+  touches the P4. The C6 is not reset before the end of its phase. Do not probe the C6
+  beforehand, and run with `--sdio-qa-interactive` so that every gesture is awaited.
 * The campaign stops at the first scenario that is not `PASS`; evidence is kept, nothing more
   is programmed, then cleanup runs.
 * A board is restored only if a write was engaged on it. A backup alone is not a reason.
