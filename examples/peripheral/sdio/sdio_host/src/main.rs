@@ -102,6 +102,11 @@ fn wait_ready(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
 }
 
 fn enumerate(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
+    // The SD physical layer needs at least 74 clocks before the first command.
+    host.send_init_sequence().map_err(|error| {
+        println!("Init clocks failed: {:?}", error);
+        "init clocks failed"
+    })?;
     command(host, sdio::common::idle())?;
     let inquiry = command(host, sdio::sdio::io_send_op_cond(false, 0))?;
     if inquiry.ocr == u32::MAX || (inquiry.ocr >> 28) & 7 == 0 {
