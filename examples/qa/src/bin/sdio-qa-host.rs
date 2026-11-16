@@ -8,7 +8,12 @@
 //! (function 1, 0x60) and the CCCR `IOR1` bit. It never retries a transfer.
 //!
 //! Pins: slot 1 routed through the GPIO matrix, CLK GPIO18, CMD GPIO19, DATA0..3 GPIO14..17,
-//! C6 EN on GPIO54, console UART0 TX on GPIO37.
+//! C6 EN on GPIO54, console UART0 TX on GPIO37 and RX on GPIO38.
+//!
+//! The C6 EN pin is wired to GPIO54: this firmware can reset the C6 by itself, and a reset of the
+//! P4 reboots the C6. After a scenario (and from boot in the `c6ctl` scenario) it listens on the
+//! console for line commands `C6 HOLD`, `C6 RELEASE`, `C6 RESET` and `C6 PING`, so that the C6
+//! can be reset by software while its GPIO9 is grounded by hand to enter ROM download.
 
 //% CHIP_FILTER: esp32p4
 
@@ -40,6 +45,8 @@ use esp_hal::{
 };
 use esp_println::println;
 use qa_test::sdio_qa::{
+    C6_RESET_MS,
+    C6Command,
     CREDIT_MASK,
     LENGTH_MASK,
     ODD_LENGTH,
@@ -604,19 +611,75 @@ fn reset_c6(en: &mut Output<'_>, delay: &Delay) {
     delay.delay_millis(2000);
 }
 
+/// Level of GPIO54 as text for the acknowledgements.
+fn en_text(en: &Output<'_>) -> &'static str {
+    if en.is_set_high() { "high" } else { "low" }
+}
+
+fn c6ctl_apply(command: C6Command, en: &mut Output<'_>, delay: &Delay) {
+    match command {
+        C6Command::Hold => en.set_low(),
+        C6Command::Release => en.set_high(),
+        C6Command::Reset => {
+            en.set_low();
+            delay.delay_millis(C6_RESET_MS);
+            en.set_high();
+        }
+        C6Command::Ping => {}
+    }
+    qa!("c6ctl|ack={}|en={}", command.name(), en_text(en));
+}
+
+/// Never returns: reads console lines and drives the C6 EN line. The only state it changes is
+/// GPIO54; every command is acknowledged on the console, an unknown line is reported.
+fn c6ctl_loop(console: &mut Uart<'_, Blocking>, en: &mut Output<'_>, delay: &Delay) -> ! {
+    qa!("c6ctl|ready|en={}", en_text(en));
+    let mut line = [0u8; 32];
+    let mut length = 0;
+    loop {
+        let mut chunk = [0u8; 16];
+        let count = console.read_buffered(&mut chunk).unwrap_or(0);
+        for &byte in &chunk[..count] {
+            if byte == b'\n' || byte == b'\r' {
+                if length > 0 {
+                    match C6Command::parse(&line[..length]) {
+                        Some(command) => c6ctl_apply(command, en, delay),
+                        None => qa!("c6ctl|unknown_command|length={}", length),
+                    }
+                    length = 0;
+                }
+            } else if length < line.len() {
+                line[length] = byte;
+                length += 1;
+            } else {
+                qa!("c6ctl|line_too_long");
+                length = 0;
+            }
+        }
+        delay.delay_millis(5);
+    }
+}
+
 #[main]
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     let delay = Delay::new();
-    // The reference board routes this pin to C6 EN. Keep the C6 in reset during setup.
-    let mut c6_enable = Output::new(peripherals.GPIO54, Level::Low, OutputConfig::default());
-    let _console = Uart::new(
+    // The reference board routes this pin to C6 EN. A scenario keeps the C6 in reset during
+    // setup; the control firmware leaves it running so that it does not disturb a C6 held in ROM
+    // download by hand.
+    let initial = if SCENARIO == Scenario::C6Ctl { Level::High } else { Level::Low };
+    let mut c6_enable = Output::new(peripherals.GPIO54, initial, OutputConfig::default());
+    let mut console = Uart::new(
         peripherals.UART0,
         UartConfig::default().with_baudrate(115_200),
     )
     .unwrap()
-    .with_tx(peripherals.GPIO37);
+    .with_tx(peripherals.GPIO37)
+    .with_rx(peripherals.GPIO38);
     qa!("boot|firmware=sdio-qa-host|scenario={}", SCENARIO_NAME);
+    if SCENARIO == Scenario::C6Ctl {
+        c6ctl_loop(&mut console, &mut c6_enable, &delay);
+    }
     let controller = SdHostController::new(peripherals.SDHOST, Config::default()).unwrap();
     let mut host = controller
         .slot::<1>(SlotConfig::default())
@@ -638,13 +701,13 @@ fn main() -> ! {
         Scenario::H3 => run_h3(&mut host, &delay),
         Scenario::H4 => run_h4(&mut host, &delay),
         Scenario::H567 => run_h567(&mut host, &delay),
+        Scenario::C6Ctl => Ok(()),
     };
     match result {
         Ok(()) => qa!("RESULT|{}|P4_PASS", SCENARIO_NAME),
         Err(reason) => qa!("RESULT|{}|P4_FAIL|{}", SCENARIO_NAME, reason),
     }
-    // No retry or further reset: a failed scenario requires a fresh session.
-    loop {
-        delay.delay_millis(1000);
-    }
+    // No retry or further reset: a failed scenario requires a fresh session. The C6 can still be
+    // controlled from the console.
+    c6ctl_loop(&mut console, &mut c6_enable, &delay)
 }

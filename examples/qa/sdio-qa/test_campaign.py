@@ -1,5 +1,6 @@
 """Software-only tests of the campaign flow with doubles. They show the safeguards without any
 board; they are simulations and never hardware evidence."""
+import base64
 import hashlib
 import importlib.util
 import json
@@ -15,10 +16,6 @@ inputs, verdict = flow.inputs, flow.verdict
 SHA = "a" * 40
 TABLE = [{"label": "factory", "type": 0, "subtype": 0, "address": 0x10000, "size": 0x100000}]
 LAYOUT = {"write_address": 0, "partitions": TABLE}
-
-
-class Calls(list):
-    pass
 
 
 class Campaign:
@@ -40,10 +37,11 @@ class Campaign:
 class Board:
     """Blank flash (no valid table) until it is programmed, then the image's table."""
 
-    def __init__(self, key, calls, spec):
-        self.key, self.calls, self.spec = key, calls, spec
-        self.existing = None  # a valid table present before programming, if a test sets one
+    def __init__(self, key, calls, spec, world):
+        self.key, self.calls, self.spec, self.world = key, calls, spec, world
+        self.existing = None
         self.written = TABLE
+        self.fail_command = False
 
     def identify(self):
         return {"chip": self.spec["chip"], "flash_size": self.spec["flash_size"]}
@@ -59,13 +57,20 @@ class Board:
         self.calls.append(("renew", self.key))
 
     def console(self):
-        pass
+        self.calls.append(("console", self.key))
 
     def cursor(self):
         return 0
 
     def events(self, cursor):
         return []
+
+    def command(self, name, args):
+        assert name == "uart.write" and self.key == "p4"
+        text = base64.b64decode(args["data"]).decode().strip()
+        self.calls.append(("uart.write", "p4", text))
+        if not self.fail_command:
+            self.world["pending"].append(f"QA|P4|t=1|c6ctl|ack={text}|en=high\r\n")
 
 
 class Orchestrator:
@@ -85,7 +90,6 @@ class Orchestrator:
         self.grant = grant_seconds
 
     def program(self, board, *, address, source, sha256, allow_destructive, timeout):
-        # Same budget rule as iobewi_bench.Orchestrator.program().
         assert self.grant >= 2 * timeout + 90, "grant too short for programming and readback"
         assert ("renew", self.key) in self.calls
         self.calls.append(("program", self.key, Path(source).name))
@@ -101,92 +105,162 @@ class Orchestrator:
 
 @pytest.fixture
 def world(tmp_path):
-    calls = Calls()
-    params = {"expected_source_sha": SHA, "scenario_timeout_seconds": 1,
+    calls = []
+    params = {"expected_source_sha": SHA, "scenario_timeout_seconds": 100,
               "p4": {"device": "p", "chip": "esp32p4", "flash_size": 1 << 25},
               "c6": {"device": "c", "chip": "esp32c6", "flash_size": 1 << 23}}
     build = {"artifacts": [{"scenario": s, "role": r, "image": f"{s}-{r}.bin", "elf_sha256": "0",
-                            "image_sha256": "0", "image_size": 4096, "layout": LAYOUT} for s in ("h1", "h2") for r in ("host", "slave")]}
-    campaigns = {k: Campaign(tmp_path, k) for k in ("p4", "c6")}
-    return {"calls": calls, "params": params, "build": build, "consent": {},
-            "regions": {"p4": (0, 0x20000), "c6": (0, 0x20000)}, "tmp": tmp_path, "campaigns": campaigns,
-            "boards": {k: Board(k, calls, params[k]) for k in ("p4", "c6")},
-            "orchestrators": {k: Orchestrator(k, calls, tmp_path) for k in ("p4", "c6")}}
+                            "image_sha256": "0", "image_size": 4096, "layout": LAYOUT}
+                           for s in ("h1", "h2") for r in ("host", "slave")]
+             + [{"scenario": "c6ctl", "role": "host", "image": "c6ctl-host.bin", "elf_sha256": "0",
+                 "image_sha256": "0", "image_size": 4096, "layout": LAYOUT}]}
+    w = {"calls": calls, "params": params, "build": build, "consent": {}, "pending": [],
+         "regions": {"p4": (0, 0x20000), "c6": (0, 0x20000)}, "tmp": tmp_path,
+         "campaigns": {k: Campaign(tmp_path, k) for k in ("p4", "c6")}}
+    w["boards"] = {k: Board(k, calls, params[k], w) for k in ("p4", "c6")}
+    w["orchestrators"] = {k: Orchestrator(k, calls, tmp_path) for k in ("p4", "c6")}
+    return w
+
+
+WORLD = {}
 
 
 class FakeConsole:
+    """Scenario lines are delivered at start; control acknowledgements as they are produced."""
     script = {}
 
     def __init__(self, board):
         self.board = board
         self.assembler = verdict.LineAssembler()
+        self.raw = bytearray()
 
     def start(self):
         for text in self.script.get(self.board.key, []):
             self.assembler.feed(text.encode())
 
     def poll(self):
-        pass
-
-    raw = b""
+        if self.board.key == "p4":
+            pending, WORLD["pending"][:] = list(WORLD["pending"]), []
+            for text in pending:
+                self.assembler.feed(text.encode())
 
 
 def go(world, scenarios, script=None):
+    WORLD.clear()
+    WORLD.update(world)
     FakeConsole.script = script or {}
-    FakeConsole.raw = bytearray()
     return flow.run(world["params"], world["consent"], scenarios, world["regions"], world["build"],
-                    world["tmp"], world["campaigns"],
-                    world["orchestrators"], world["boards"], FakeConsole,
-                    lambda label: world["calls"].append(("gesture", label)),
-                    sleep=lambda s: None, clock=iter(range(0, 1000, 5)).__next__)
-
-
-def p4_written(world):
-    return [c for c in world["calls"] if c[0] == "program" and c[1] == "p4"]
+                    world["tmp"], world["campaigns"], world["orchestrators"], world["boards"],
+                    FakeConsole, lambda label: world["calls"].append(("gesture", label)),
+                    sleep=lambda s: None, clock=iter(range(0, 100000, 1)).__next__)
 
 
 def kinds(world):
     return [c[0] for c in world["calls"]]
 
 
-def test_c6_backup_mismatch_blocks_everything_and_restores_nothing(world):
+def p4_scenario_written(world):
+    return [c for c in world["calls"] if c[0] == "program" and c[1] == "p4" and "c6ctl" not in c[2]]
+
+
+def idx(world, predicate):
+    return next(i for i, c in enumerate(world["calls"]) if predicate(c))
+
+
+def test_order_p4_control_firmware_then_c6_then_p4_scenario(world):
+    go(world, ["h1"])
+    calls = world["calls"]
+    control = idx(world, lambda c: c[:2] == ("program", "p4") and "c6ctl" in c[2])
+    reset = idx(world, lambda c: c[:3] == ("uart.write", "p4", "C6 RESET"))
+    c6_backup = idx(world, lambda c: c[:2] == ("backup", "c6"))
+    c6_program = idx(world, lambda c: c[:2] == ("program", "c6"))
+    p4_scenario = idx(world, lambda c: c[:2] == ("program", "p4") and "c6ctl" not in c[2])
+    assert control < reset < c6_backup < c6_program < p4_scenario
+
+
+def test_c6_is_never_reset_by_a_p4_operation_during_its_phase(world):
+    go(world, ["h1"])
+    calls = world["calls"]
+    reset = idx(world, lambda c: c[:3] == ("uart.write", "p4", "C6 RESET"))
+    c6_program = idx(world, lambda c: c[:2] == ("program", "c6"))
+    between = [c for c in calls[reset:c6_program] if len(c) > 1 and c[1] == "p4" and c[0] != "gesture"]
+    assert [c[:3] for c in between] == [("uart.write", "p4", "C6 RESET")]
+    assert [c for c in calls[reset:c6_program] if c[0] == "backup" and c[1] == "p4"] == []
+
+
+def test_gpio9_gestures_frame_the_c6_phase(world):
+    go(world, ["h1"])
+    labels = [c[1] for c in world["calls"] if c[0] == "gesture"]
+    ground = next(i for i, t in enumerate(labels) if "ground the C6 GPIO9" in t)
+    release = next(i for i, t in enumerate(labels) if "release the C6 GPIO9" in t)
+    assert ground < release
+
+
+def test_missing_acknowledgement_stops_before_any_c6_write(world):
+    world["boards"]["p4"].fail_command = True
+    outcome = go(world, ["h1"])
+    assert isinstance(outcome.error, TimeoutError)
+    assert not [c for c in world["calls"] if c[:2] == ("program", "c6") or c[:2] == ("backup", "c6")]
+    assert ("restore", "p4") in world["calls"]  # the control firmware was written: restored
+
+
+def test_every_control_command_is_a_known_listener_command(world):
+    go(world, ["h1", "h2"])
+    sent = {c[2] for c in world["calls"] if c[0] == "uart.write"}
+    assert sent <= {"C6 RESET", "C6 PING", "C6 HOLD", "C6 RELEASE"}
+
+
+def test_p4_console_is_opened_once_per_p4_boot(world):
+    go(world, ["h1"])
+    opens = [c for c in world["calls"] if c[:2] == ("console", "p4")]
+    # once for the control firmware, once when the scenario image is observed
+    assert len(opens) == 2
+
+
+def test_c6_backup_mismatch_blocks_every_c6_write_and_restores_the_p4(world):
     world["orchestrators"]["c6"].differ = True
     outcome = go(world, ["h1"])
     assert isinstance(outcome.error, inputs.InputError)
-    assert "program" not in kinds(world)
-    assert "restore" not in kinds(world) and "compare" not in kinds(world)
+    assert not [c for c in world["calls"] if c[:2] == ("program", "c6")]
+    assert not p4_scenario_written(world)
+    assert ("restore", "c6") not in world["calls"] and ("restore", "p4") in world["calls"]
     assert all(c.closed for c in world["campaigns"].values())
+
+
+def test_p4_backup_mismatch_writes_nothing(world):
+    world["orchestrators"]["p4"].differ = True
+    outcome = go(world, ["h1"])
+    assert isinstance(outcome.error, inputs.InputError)
+    assert "program" not in kinds(world) and "restore" not in kinds(world)
 
 
 def test_valid_existing_table_is_not_overwritten_without_consent(world):
     world["boards"]["p4"].existing = [{"address": 0x9000, "type": 1, "size": 0x6000}]
     outcome = go(world, ["h1"])
     assert isinstance(outcome.error, inputs.InputError) and "allow_overwrite_valid_table" in str(outcome.error)
-    assert not p4_written(world) and ("backup", "p4", inputs.RESTORE_TIMEOUT) not in world["calls"]
+    assert "program" not in kinds(world) and "backup" not in kinds(world)
 
 
 def test_valid_existing_table_with_consent_is_backed_up_then_overwritten(world):
     world["boards"]["p4"].existing = [{"address": 0x9000, "type": 1, "size": 0x6000}]
     world["consent"]["allow_overwrite_valid_table"] = True
-    outcome = go(world, ["h1"])
-    assert ("backup", "p4", inputs.RESTORE_TIMEOUT) in world["calls"]
-    first_p4_backup = world["calls"].index(("backup", "p4", inputs.RESTORE_TIMEOUT))
-    assert first_p4_backup < world["calls"].index(("program", "p4", "h1-host.bin"))
-    assert outcome.error is None or not isinstance(outcome.error, inputs.InputError)
+    go(world, ["h1"])
+    first_backup = idx(world, lambda c: c[:2] == ("backup", "p4"))
+    first_write = idx(world, lambda c: c[:2] == ("program", "p4"))
+    assert first_backup < first_write
 
 
 def test_blank_flash_is_accepted_and_both_regions_are_backed_up_twice(world):
     go(world, ["h1"])
-    assert [c[1] for c in world["calls"] if c[0] == "backup"].count("p4") == 2
-    assert [c[1] for c in world["calls"] if c[0] == "backup"].count("c6") == 2
+    backups = [c[1] for c in world["calls"] if c[0] == "backup"]
+    assert backups.count("p4") == 2 and backups.count("c6") == 2
 
 
 def test_written_table_mismatch_stops_and_restores(world):
-    world["boards"]["c6"].written = []
+    world["boards"]["p4"].written = []
     outcome = go(world, ["h1"])
     assert isinstance(outcome.error, inputs.InputError) and "differs from the image" in str(outcome.error)
-    assert not any(c[0] == "program" and c[1] == "p4" for c in world["calls"])
-    assert ("restore", "c6") in world["calls"]
+    assert ("restore", "p4") in world["calls"]
 
 
 def test_unexpected_partition_read_error_is_not_taken_for_a_blank_flash(world):
@@ -195,30 +269,33 @@ def test_unexpected_partition_read_error_is_not_taken_for_a_blank_flash(world):
 
     world["boards"]["p4"].partitions = broken
     outcome = go(world, ["h1"])
-    assert isinstance(outcome.error, RuntimeError) and not p4_written(world)
+    assert isinstance(outcome.error, RuntimeError) and "program" not in kinds(world)
 
 
 def test_first_failing_scenario_stops_programming_and_restores_programmed_boards(world):
     outcome = go(world, ["h1", "h2"])  # empty consoles: H1 is INDETERMINATE, not PASS
-    programmed = [c for c in world["calls"] if c[0] == "program"]
-    assert {c[2] for c in programmed} == {"h1-slave.bin", "h1-host.bin"}
-    assert not any("h2" in c[2] for c in programmed)
+    programmed = [c[2] for c in world["calls"] if c[0] == "program"]
+    assert not any("h2" in name for name in programmed)
     assert outcome.failed_verdicts and set(outcome.restored) == {"p4", "c6"}
     assert [c[1] for c in world["calls"] if c[0] == "restore"] == ["c6", "p4"]
 
 
-def test_only_the_board_with_an_engaged_mutation_is_restored(world):
-    orchestrator = world["orchestrators"]["p4"]
+def test_c6_restore_uses_the_p4_control_listener(world):
+    go(world, ["h1"])
+    resets = [c for c in world["calls"] if c[:3] == ("uart.write", "p4", "C6 RESET")]
+    assert len(resets) == 2  # one before programming, one before the restoration
+    restore = idx(world, lambda c: c[:2] == ("restore", "c6"))
+    assert idx(world, lambda c: c[:3] == ("uart.write", "p4", "C6 RESET") and c is resets[1]) < restore
 
+
+def test_only_the_board_with_an_engaged_mutation_is_restored(world):
     def failing(*args, **kwargs):
         raise RuntimeError("write failed")
 
     world["orchestrators"]["c6"].program = failing
     outcome = go(world, ["h1"])
-    assert outcome.mutated == {"c6"}
-    assert [c for c in world["calls"] if c[0] in {"restore", "program"} and c[1] == "p4"] == []
-    assert [c for c in world["calls"] if c[0] == "restore"] == [("restore", "c6")]
-    assert orchestrator.grant == 0
+    assert "c6" in outcome.mutated
+    assert [c for c in world["calls"] if c[0] == "restore"] == [("restore", "c6"), ("restore", "p4")]
 
 
 def test_grant_budget_is_requested_for_programming_and_restoration(world):
@@ -232,7 +309,7 @@ def test_historical_backup_divergence_blocks_before_programming(world, tmp_path)
     world["params"]["p4"]["historical_backup"] = {"path": str(path),
                                                   "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     outcome = go(world, ["h1"])
-    assert isinstance(outcome.error, inputs.InputError) and not p4_written(world)
+    assert isinstance(outcome.error, inputs.InputError) and "program" not in kinds(world)
 
 
 class ScriptedConsole:
@@ -250,60 +327,61 @@ class ScriptedConsole:
 
     def poll(self):
         self.polls += 1
-        if self.fail_at is not None and self.polls > self.fail_at:
-            raise ConnectionError("continuity interrupted")
-        for text in self.chunks.get(self.board.key, {}).get(self.polls, []):
-            self.raw += text.encode()
-            self.assembler.feed(text.encode())
+        if self.board.key == "p4":
+            pending, WORLD["pending"][:] = list(WORLD["pending"]), []
+            for text in pending:
+                self.raw += text.encode()
+                self.assembler.feed(text.encode())
+            for text in self.chunks.get("p4", {}).get(self.polls, []):
+                self.raw += text.encode()
+                self.assembler.feed(text.encode())
+            if self.fail_at is not None and self.polls > self.fail_at and self.board.scenario_phase:
+                raise ConnectionError("continuity interrupted")
+        else:
+            if self.fail_at is not None and self.polls > self.fail_at and self.board.scenario_phase:
+                raise ConnectionError("continuity interrupted")
+            for text in self.chunks.get(self.board.key, {}).get(self.polls, []):
+                self.raw += text.encode()
+                self.assembler.feed(text.encode())
 
 
 def go_scripted(world, scenario, chunks, fail_at=None):
+    WORLD.clear()
+    WORLD.update(world)
     ScriptedConsole.chunks, ScriptedConsole.fail_at = chunks, fail_at
-    world["params"]["scenario_timeout_seconds"] = 100
+    for board in world["boards"].values():
+        board.scenario_phase = False
+    original = world["orchestrators"]["p4"].program
+
+    def program(board, **kw):
+        original(board, **kw)
+        if "c6ctl" not in str(kw["source"]):
+            for b in world["boards"].values():
+                b.scenario_phase = True
+
+    world["orchestrators"]["p4"].program = program
     return flow.run(world["params"], world["consent"], [scenario], world["regions"], world["build"],
-                    world["tmp"], world["campaigns"],
-                    world["orchestrators"], world["boards"], ScriptedConsole, lambda label: None,
-                    sleep=lambda s: None, clock=iter(range(0, 10000, 1)).__next__)
+                    world["tmp"], world["campaigns"], world["orchestrators"], world["boards"],
+                    ScriptedConsole, lambda label: None, sleep=lambda s: None,
+                    clock=iter(range(0, 100000, 1)).__next__)
 
 
 def test_partial_uart_is_saved_when_observation_is_interrupted(world):
     line = "QA|C6|t=1|boot|firmware=sdio-qa-slave|scenario=h1\r\n"
     outcome = go_scripted(world, "h1", {"c6": {1: [line]}}, fail_at=1)
     assert isinstance(outcome.error, ConnectionError)
-    saved = world["campaigns"]["c6"].directory / "uart-h1.log"
-    assert saved.read_bytes() == line.encode()
     meta = json.loads((world["campaigns"]["c6"].directory / "uart-h1-lines.json").read_text())
     assert meta["complete_observation"] is False and meta["error"] == "ConnectionError"
+    assert (world["campaigns"]["c6"].directory / "uart-h1.log").read_bytes() == line.encode()
     assert set(outcome.restored) == {"p4", "c6"}  # cleanup still ran after the capture
 
 
 def test_h1_collection_waits_for_the_third_c6_session(world):
     done = "QA|C6|t=1|RESULT|h1|C6_DONE|state=BusExposed\r\n"
     p4 = "QA|P4|t=1|RESULT|h1|P4_PASS\r\n"
-    outcome = go_scripted(world, "h1", {"p4": {1: [p4]}, "c6": {1: [done], 3: [done], 5: [done]}})
-    c6_lines = json.loads((world["campaigns"]["c6"].directory / "uart-h1-lines.json").read_text())["lines"]
-    assert len([x for x in c6_lines if x[2].startswith("RESULT")]) == 3
+    chunks = {"p4": {1: [p4]}, "c6": {1: [done], 3: [done], 5: [done]}}
+    outcome = go_scripted(world, "h1", chunks)
+    lines = json.loads((world["campaigns"]["c6"].directory / "uart-h1-lines.json").read_text())
+    assert lines["complete_observation"] is True
+    assert len([x for x in lines["lines"] if x[0] == "C6" and x[2].startswith("RESULT")]) == 3
     assert outcome.error is None
-
-
-def test_c6_is_fully_handled_before_any_p4_operation(world):
-    go(world, ["h1"])
-    calls = world["calls"]
-    ops = [c for c in calls if c[0] in {"backup", "program", "restore", "compare"}]
-    first_p4 = next(i for i, c in enumerate(ops) if c[1] == "p4")
-    c6_before = [c for c in ops[:first_p4] if c[1] == "c6"]
-    assert [c[0] for c in c6_before] == ["backup", "backup", "program"]
-    assert not [c for c in ops[:first_p4] if c[1] == "p4"]
-    # one gesture for the C6 before its preparation, and none repeated before its first write
-    gestures = [c[1] for c in calls[:next(i for i, c in enumerate(calls) if c[0] == "program")]
-                if c[0] == "gesture"]
-    assert len(gestures) == 1 and "C6 in ROM download" in gestures[0]
-
-
-def test_each_board_is_written_only_after_its_own_two_identical_backups(world):
-    world["orchestrators"]["p4"].differ = True
-    outcome = go(world, ["h1"])
-    assert isinstance(outcome.error, inputs.InputError)
-    assert ("program", "c6", "h1-slave.bin") in world["calls"]  # the C6 phase was complete
-    assert not [c for c in world["calls"] if c[0] == "program" and c[1] == "p4"]
-    assert ("restore", "c6") in world["calls"] and ("restore", "p4") not in world["calls"]

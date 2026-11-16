@@ -33,7 +33,7 @@ python examples/qa/sdio-qa/build.py --base <qualified base SHA> --output <new pr
   --p4-flash-size 32mb --c6-flash-size 8mb   # the verified capacities of the two boards
 ```
 
-Scenarios: `h1`, `h2`, `h3`, `h4`, `h567` (H5, H6 and H7 form one ordered sequence because H7
+Scenarios: `h1`, `h2`, `h3`, `h4`, `h567` and the P4-only control image `c6ctl` (H5, H6 and H7 form one ordered sequence because H7
 resynchronizes after H5 and H6). Each image is a
 **full flash-prefix image** made from the ELF by `espflash save-image --merge --skip-padding`:
 it starts at flash address 0 and holds the second-stage bootloader (bundled with espflash,
@@ -122,12 +122,22 @@ and unobservable properties are reported separately.
 
 ## Campaign safeguards
 
-* The C6 EN pin is wired to a P4 GPIO, and the operator reaches the C6 only through that
-  arrangement: any P4 operation or reset reboots the C6 and takes it out of ROM download. The
-  recipe therefore does everything on the C6 first and in one go (identify, two backups,
-  programming, table check), asks for one gesture to put the C6 in download, and only then
-  touches the P4. The C6 is not reset before the end of its phase. Do not probe the C6
-  beforehand, and run with `--sdio-qa-interactive` so that every gesture is awaited.
+* **Soft control of the C6 from the P4.** The C6 EN pin is wired to P4 GPIO54, only the C6
+  UART TX/RX reach the operator, and a P4 reset reboots the C6. The P4 therefore runs a control
+  firmware (`c6ctl` scenario, also the idle state after every scenario) that reads console lines
+  and drives GPIO54: `C6 HOLD` (EN low), `C6 RELEASE` (EN high), `C6 RESET` (EN low 200 ms then
+  high) and `C6 PING`; each is acknowledged as `c6ctl|ack=<command>|en=<level>`. The recipe sends
+  them with the bench `uart.write` command (local grant) and opens the P4 console only once per
+  P4 boot, because opening the port may itself reset the P4.
+* **Order of a campaign.** The P4 is identified and backed up in ROM download, then written with
+  the `c6ctl` image and reset. For each scenario: the operator grounds the C6 GPIO9 (BOOT) by
+  hand, the P4 resets the C6 by software so that it enters ROM download, and the C6 phase runs
+  in one go (identify and two backups once, programming, table check); the operator then releases
+  GPIO9, puts the P4 in ROM download and the P4 scenario image is written and booted. The P4
+  reset reboots the already programmed C6. The C6 restoration uses the same GPIO9 + `C6 RESET`
+  sequence through the control listener.
+* A missing acknowledgement stops the campaign before any C6 write; only `C6 PING` is repeated,
+  because it changes nothing. Do not probe the C6 beforehand.
 * The campaign stops at the first scenario that is not `PASS`; evidence is kept, nothing more
   is programmed, then cleanup runs.
 * A board is restored only if a write was engaged on it. A backup alone is not a reason.

@@ -24,8 +24,10 @@ SHA = "a" * 40
 @pytest.fixture
 def case(tmp_path):
     artifacts = []
-    for scenario in inputs.SCENARIOS:
+    for scenario in (*inputs.SCENARIOS, inputs.CONTROL_SCENARIO):
         for role, chip in (("host", "esp32p4"), ("slave", "esp32c6")):
+            if scenario == inputs.CONTROL_SCENARIO and role == "slave":
+                continue
             image = tmp_path / scenario / f"{role}.bin"
             image.parent.mkdir(exist_ok=True)
             image.write_bytes(fake.make(chip, app_bytes=8192 if scenario != "h1" else 4096))
@@ -125,3 +127,17 @@ def test_historical_backup_divergence_blocks():
         inputs.check_historical(declared, data, b"\0" * 4096, 0, 4096)
     with pytest.raises(inputs.InputError, match="declared SHA-256"):
         inputs.check_historical({"sha256": "0" * 64}, data, data[0:4096], 0, 4096)
+
+
+def test_control_image_is_required(case):
+    params, consent, build, directory = case
+    build["artifacts"] = [a for a in build["artifacts"] if a["scenario"] != inputs.CONTROL_SCENARIO]
+    with pytest.raises(inputs.InputError, match="c6ctl"):
+        inputs.validate(params, consent, build, directory)
+
+
+def test_control_image_is_not_a_consented_scenario(case):
+    params, consent, build, directory = case
+    consent["scenarios"] = ["c6ctl"]
+    with pytest.raises(inputs.InputError, match="known scenarios"):
+        inputs.validate(params, consent, build, directory)

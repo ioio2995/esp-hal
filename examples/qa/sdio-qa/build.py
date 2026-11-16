@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import importlib.util
 
-SCENARIOS = ("h1", "h2", "h3", "h4", "h567")
+SCENARIOS = ("h1", "h2", "h3", "h4", "h567", "c6ctl")  # c6ctl has a P4 image only
 FIRMWARE = {
     "host": {"bin": "sdio-qa-host", "chip": "esp32p4", "target": "riscv32imafc-unknown-none-elf"},
     "slave": {"bin": "sdio-qa-slave", "chip": "esp32c6", "target": "riscv32imac-unknown-none-elf"},
@@ -108,6 +108,8 @@ def main():
     }
     for scenario in args.scenarios:
         for role, spec in FIRMWARE.items():
+            if scenario == "c6ctl" and role == "slave":
+                continue
             env = dict(os.environ, SDIO_QA_SCENARIO=scenario, RUST_BACKTRACE="0")
             command = ["cargo", "xtask", "build", spec["bin"], spec["chip"]]
             run(command, root, env)

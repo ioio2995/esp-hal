@@ -17,7 +17,7 @@ pub const SCENARIO_NAME: &str = match option_env!("SDIO_QA_SCENARIO") {
 /// Scenario selected at build time.
 pub const SCENARIO: Scenario = match Scenario::parse(SCENARIO_NAME) {
     Some(scenario) => scenario,
-    None => panic!("SDIO_QA_SCENARIO must be one of: h1, h2, h3, h4, h567"),
+    None => panic!("SDIO_QA_SCENARIO must be one of: h1, h2, h3, h4, h567, c6ctl"),
 };
 
 /// Hardware scenarios of the qualification mandate.
@@ -33,6 +33,8 @@ pub enum Scenario {
     H4,
     /// Stop an unused receive (H5), an unconsumed transmit (H6), then resynchronize (H7).
     H567,
+    /// P4 only: no SDIO, just a soft control of the C6 EN line (GPIO54) from the console.
+    C6Ctl,
 }
 
 impl Scenario {
@@ -49,6 +51,8 @@ impl Scenario {
             Some(Self::H4)
         } else if bytes_eq(name, b"h567") {
             Some(Self::H567)
+        } else if bytes_eq(name, b"c6ctl") {
+            Some(Self::C6Ctl)
         } else {
             None
         }
@@ -170,6 +174,49 @@ pub const RECEIVE_EVENT_BITS: u32 = (1 << 15) | (1 << 19) | (1 << 11);
 /// (`events.rs` TRANSMIT_EVENTS: 17, 20, 10).
 pub const TRANSMIT_EVENT_BITS: u32 = (1 << 17) | (1 << 20) | (1 << 10);
 
+/// Console command that controls the C6 EN line from the P4 (GPIO54). Lines end with `\n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C6Command {
+    /// Drive EN low: the C6 stays in reset.
+    Hold,
+    /// Drive EN high: the C6 boots (or enters ROM download if its GPIO9 is grounded).
+    Release,
+    /// EN low, then high: a reset of the C6.
+    Reset,
+    /// No effect, acknowledged: the listener is alive.
+    Ping,
+}
+
+impl C6Command {
+    /// Parses one console line, without its terminator.
+    pub fn parse(line: &[u8]) -> Option<Self> {
+        if bytes_eq(line, b"C6 HOLD") {
+            Some(Self::Hold)
+        } else if bytes_eq(line, b"C6 RELEASE") {
+            Some(Self::Release)
+        } else if bytes_eq(line, b"C6 RESET") {
+            Some(Self::Reset)
+        } else if bytes_eq(line, b"C6 PING") {
+            Some(Self::Ping)
+        } else {
+            None
+        }
+    }
+
+    /// Text the listener echoes in its acknowledgement.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Hold => "C6 HOLD",
+            Self::Release => "C6 RELEASE",
+            Self::Reset => "C6 RESET",
+            Self::Ping => "C6 PING",
+        }
+    }
+}
+
+/// Duration EN is held low by `C6 RESET`.
+pub const C6_RESET_MS: u32 = 200;
+
 /// Index of the first differing byte, or the shorter length if one slice is a prefix.
 pub fn first_mismatch(a: &[u8], b: &[u8]) -> Option<usize> {
     let common = a.len().min(b.len());
@@ -186,6 +233,7 @@ mod tests {
     fn scenario_names() {
         assert_eq!(Scenario::parse("h1"), Some(Scenario::H1));
         assert_eq!(Scenario::parse("h567"), Some(Scenario::H567));
+        assert_eq!(Scenario::parse("c6ctl"), Some(Scenario::C6Ctl));
         assert_eq!(Scenario::parse("h5"), None);
         assert_eq!(Scenario::parse(""), None);
     }
@@ -244,6 +292,20 @@ mod tests {
         let armed_receive = (1u32 << 31) | 128;
         assert!(descriptor_owner_dma(armed_receive) && !descriptor_eof(armed_receive));
         assert_eq!(descriptor_length(armed_receive), 0);
+    }
+
+    #[test]
+    fn c6_commands_parse_exactly() {
+        assert_eq!(C6Command::parse(b"C6 RESET"), Some(C6Command::Reset));
+        assert_eq!(C6Command::parse(b"C6 HOLD"), Some(C6Command::Hold));
+        assert_eq!(C6Command::parse(b"C6 RELEASE"), Some(C6Command::Release));
+        assert_eq!(C6Command::parse(b"C6 PING"), Some(C6Command::Ping));
+        assert_eq!(C6Command::parse(b"c6 reset"), None);
+        assert_eq!(C6Command::parse(b"C6 RESET "), None);
+        assert_eq!(C6Command::parse(b""), None);
+        for c in [C6Command::Hold, C6Command::Release, C6Command::Reset, C6Command::Ping] {
+            assert_eq!(C6Command::parse(c.name().as_bytes()), Some(c));
+        }
     }
 
     #[test]

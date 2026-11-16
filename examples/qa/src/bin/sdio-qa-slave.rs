@@ -531,6 +531,7 @@ async fn main(_spawner: Spawner) {
         Scenario::H1 | Scenario::H2 | Scenario::H4 => h1_h2_h4(&mut bus, storage).await,
         Scenario::H3 => h3(&mut bus, storage).await,
         Scenario::H567 => h567(&mut bus, storage).await,
+        Scenario::C6Ctl => Err("c6ctl is a P4-only scenario"),
     };
     if let Err(reason) = result {
         qa!("RESULT|{}|C6_FAIL|{}", SCENARIO_NAME, reason);

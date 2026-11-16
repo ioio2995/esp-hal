@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 
 SCENARIOS = ("h1", "h2", "h3", "h4", "h567")
+CONTROL_SCENARIO = "c6ctl"  # P4 image that controls the C6 EN line; always required
+C6CTL_GRANT = 60  # seconds of local grant for a `uart.write` to the control firmware
 BOARD_KEYS = {"device", "chip", "flash_size", "transports"}
 PROGRAM_TIMEOUT = 120
 RESTORE_TIMEOUT = 300
@@ -109,8 +111,10 @@ def validate(params, consent, build_manifest, build_dir):
     layout = _layout()
     build_dir = Path(build_dir)
     sizes = {"p4": 0, "c6": 0}
-    for scenario in scenarios:
+    for scenario in [CONTROL_SCENARIO, *scenarios]:
         for role, key in (("host", "p4"), ("slave", "c6")):
+            if scenario == CONTROL_SCENARIO and role == "slave":
+                continue
             rows = [a for a in build_manifest["artifacts"] if a["scenario"] == scenario and a["role"] == role]
             if len(rows) != 1:
                 raise InputError(f"build manifest lacks exactly one {role} artifact for {scenario}")
