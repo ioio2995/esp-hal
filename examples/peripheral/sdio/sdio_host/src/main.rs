@@ -91,6 +91,31 @@ fn register_u32(host: &mut Host<'_>, address: u32) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+/// Reads a function-1 word for polling. The slave withdraws `IOR1` when it completes a transfer
+/// and refuses function-1 accesses with FUNCTION_NUMBER until it declares readiness again, so
+/// that refusal alone is `None`; any other R5 error stays an error.
+fn poll_u32(host: &mut Host<'_>, address: u32) -> Result<Option<u32>> {
+    let mut bytes = [0; 4];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        let response = command(
+            host,
+            sdio::sdio::Cmd52 {
+                write: false,
+                function: 1,
+                raw: false,
+                addr: address + i as u32,
+                data: 0,
+            },
+        )?;
+        match response.flags & sdio::SdioError::ALL {
+            0 => *byte = response.data,
+            sdio::SdioError::FLAG_FUNCTION_NUMBER => return Ok(None),
+            _ => return Err("CMD52 R5 error"),
+        }
+    }
+    Ok(Some(u32::from_le_bytes(bytes)))
+}
+
 fn wait_ready(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
     for _ in 0..200 {
         if register(host, 0, 3, None)? & 2 != 0 {
@@ -163,18 +188,21 @@ fn exchange(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
     println!("Sent {} bytes; waiting for the C6 echo", PACKET_LENGTH);
 
     // PKT_LEN is cumulative modulo 2^20. This fresh host session has consumed 0 bytes.
+    // The slave declares IOR1 again once the echo is armed: wait for it before polling.
+    wait_ready(host, delay)?;
     let mut available = 0;
     for _ in 0..200 {
-        available = register_u32(host, 0x60)? & 0x000f_ffff;
-        if available != 0 {
-            break;
+        if let Some(word) = poll_u32(host, 0x60)? {
+            available = word & 0x000f_ffff;
+            if available != 0 {
+                break;
+            }
         }
         delay.delay_millis(10);
     }
     if available != PACKET_LENGTH as u32 {
         return Err("unexpected echo length or timeout");
     }
-    wait_ready(host, delay)?;
     packet.0.fill(0xff);
     let dma = DmaAlignedMut::new(&mut packet.0)
         .map_err(|_| "unaligned buffer")?
