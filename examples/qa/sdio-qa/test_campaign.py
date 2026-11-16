@@ -188,6 +188,15 @@ def test_c6_is_never_reset_by_a_p4_operation_during_its_phase(world):
     assert [c for c in calls[reset:c6_program] if c[0] == "backup" and c[1] == "p4"] == []
 
 
+def test_stale_c6_loader_session_is_left_before_every_c6_reset(world):
+    go(world, ["h1"])
+    calls = world["calls"]
+    for i, c in enumerate(calls):
+        if c[:3] == ("uart.write", "p4", "C6 RESET"):
+            assert ("console", "c6") in calls[:i], "console of the C6 must precede the reset"
+            assert calls[:i].count(("console", "c6")) >= calls[:i].count(("uart.write", "p4", "C6 RESET")) + 1
+
+
 def test_gpio9_gestures_frame_the_c6_phase(world):
     go(world, ["h1"])
     labels = [c[1] for c in world["calls"] if c[0] == "gesture"]

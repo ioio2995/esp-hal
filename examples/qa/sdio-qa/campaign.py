@@ -174,6 +174,10 @@ def _c6ctl_ready(state, boards, orchestrators, make_console, sleep, clock, timeo
 
 def _c6_into_download(state, boards, orchestrators, make_console, gesture, sleep, clock):
     gesture("ground the C6 GPIO9 (BOOT) by hand now and keep it grounded until told otherwise")
+    # The page keeps its loader session open after the first contact. A reset gives the C6 a
+    # fresh ROM that this stale session cannot talk to (identify times out with no byte). The
+    # `console` command is the only way to leave it: the next loader command then re-synchronizes.
+    boards["c6"].console()
     return _c6ctl("C6 RESET", state, boards, orchestrators, make_console, sleep, clock)
 
 

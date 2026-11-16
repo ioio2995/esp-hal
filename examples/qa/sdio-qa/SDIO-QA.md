@@ -136,6 +136,10 @@ and unobservable properties are reported separately.
   GPIO9, puts the P4 in ROM download and the P4 scenario image is written and booted. The P4
   reset reboots the already programmed C6. The C6 restoration uses the same GPIO9 + `C6 RESET`
   sequence through the control listener.
+* After a reset the C6 has a fresh ROM, but the page keeps its manual-entry loader session open
+  and its commands then time out with no byte (observed). The recipe therefore issues the
+  `console` command on the C6 before each reset: it is the only way to leave that session, and
+  the next loader command re-synchronizes. The C6 loader speed is its own setting (115200).
 * A missing acknowledgement stops the campaign before any C6 write; only `C6 PING` is repeated,
   because it changes nothing. Do not probe the C6 beforehand.
 * The campaign stops at the first scenario that is not `PASS`; evidence is kept, nothing more
