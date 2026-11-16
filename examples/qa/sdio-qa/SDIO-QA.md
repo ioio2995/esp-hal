@@ -100,9 +100,20 @@ this, the P4 logs `cmd_error|CMD53 read` and the verdict is not `PASS`; classify
 only with that evidence and the documented constraint, never replace it by a 64- or 68-byte
 transfer.
 
+## Enumeration
+
+The host sends the 80 initialization clocks (`send_init_sequence()`, error reported and
+blocking) before CMD0, then CMD5 (inquiry and every ready poll, each logged with its OCR and
+ready bit) and CMD3 (R6 logged raw: RCA, status and the COM_CRC_ERROR / ILLEGAL_COMMAND / ERROR
+bits). A non-zero error bit in the R6 status refuses the enumeration, without masking and
+without retry. The R6 status describes the command received before CMD3, so a CRC bit there
+does not by itself identify CMD0, CMD5 or CMD3. Run 7 (a4932806, without the init clocks)
+failed H1 at CMD3 with status 0x8000; that result is kept as the earlier outcome.
+
 ## Log format
 
-Both consoles print `QA|<P4|C6>|t=<ms since boot>|<kind>|key=value...`. The clocks are
+Both UART cursors are armed before any console is opened, because opening the P4 port may boot
+the P4 (which resets the C6) and the boot banners must be captured. Both consoles print `QA|<P4|C6>|t=<ms since boot>|<kind>|key=value...`. The clocks are
 independent; correlate with the bench UART timestamps and with `c6_en|low`/`c6_en|high`
 (the C6 boots when EN rises). Evidence lines:
 

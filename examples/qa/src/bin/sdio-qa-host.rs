@@ -265,9 +265,23 @@ fn wait_enumerated_ready(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
 }
 
 fn enumerate(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
+    // The SD physical layer needs at least 74 clocks before the first command. The slave may
+    // otherwise decode the first command out of step and flag a CRC error on a later response.
+    if let Err(error) = host.send_init_sequence() {
+        qa!("cmd_error|init_clocks|{:?}", error);
+        return Err("init clocks failed");
+    }
+    qa!("enum|init_clocks|clocks=80");
     command(host, sdio::common::idle())?;
+    qa!("enum|CMD0|sent");
     let inquiry = command(host, sdio::sdio::io_send_op_cond(false, 0))?;
-    qa!("enum|CMD5|ocr={:#010x}", inquiry.ocr);
+    qa!(
+        "enum|CMD5|inquiry|ocr={:#010x}|functions={}|memory={}|ready={}",
+        inquiry.ocr,
+        (inquiry.ocr >> 28) & 7,
+        (inquiry.ocr >> 27) & 1,
+        inquiry.ocr >> 31
+    );
     if inquiry.ocr == u32::MAX || (inquiry.ocr >> 28) & 7 == 0 {
         return fail("card does not announce an I/O function", inquiry.ocr);
     }
@@ -276,8 +290,16 @@ fn enumerate(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
         return fail("no common 3.3 V supply window", inquiry.ocr);
     }
     let mut ready = false;
-    for _ in 0..40 {
-        if command(host, sdio::sdio::io_send_op_cond(false, window))?.ocr & (1 << 31) != 0 {
+    for attempt in 1..=40u32 {
+        let response = command(host, sdio::sdio::io_send_op_cond(false, window))?;
+        qa!(
+            "enum|CMD5|try={}|window={:#x}|ocr={:#010x}|ready={}",
+            attempt,
+            window,
+            response.ocr,
+            response.ocr >> 31
+        );
+        if response.ocr & (1 << 31) != 0 {
             ready = true;
             break;
         }
@@ -287,10 +309,15 @@ fn enumerate(host: &mut Host<'_>, delay: &Delay) -> Result<()> {
         return fail("card initialization timed out", ());
     }
     let relative = command(host, sdio::sd::Cmd3)?;
+    // R6 card status: bit 15 COM_CRC_ERROR, 14 ILLEGAL_COMMAND, 13 ERROR. It describes the
+    // command received before CMD3, not CMD3 itself.
     qa!(
-        "enum|CMD3|rca={:#06x}|status={:#06x}",
+        "enum|CMD3|rca={:#06x}|status={:#06x}|com_crc_error={}|illegal={}|error={}",
         relative.rca,
-        relative.status
+        relative.status,
+        (relative.status >> 15) & 1,
+        (relative.status >> 14) & 1,
+        (relative.status >> 13) & 1
     );
     if relative.rca == 0 || relative.status & 0xe000 != 0 {
         return fail("invalid RCA or R6 status", relative.status);

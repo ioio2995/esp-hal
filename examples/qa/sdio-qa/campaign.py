@@ -134,8 +134,8 @@ def _p4_console(state, boards, make_console):
     console = state.get("p4_console")
     if console is None:
         console = make_console(boards["p4"])
+        console.start()  # the cursor is armed before the port is opened: opening may reset the P4
         boards["p4"].console()
-        console.start()
         state["p4_console"] = console
     return console
 
@@ -186,9 +186,12 @@ def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, 
     state["p4_console"] = consoles["p4"]  # stays open for the control commands that follow
     error = None
     try:
-        for key, console in consoles.items():
-            boards[key].console()
+        # Both cursors are armed before ANY console is opened: opening the P4 port may already
+        # boot the P4, which resets the C6, and their boot banners must be captured.
+        for console in consoles.values():
             console.start()
+        for key in consoles:
+            boards[key].console()
         gesture(f"{scenario}: reset the P4 so that it boots the scenario (it resets the C6 itself)")
         deadline = clock() + params.get("scenario_timeout_seconds", 90)
         while clock() < deadline:

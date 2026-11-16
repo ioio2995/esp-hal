@@ -135,6 +135,7 @@ class FakeConsole:
         self.raw = bytearray()
 
     def start(self):
+        self.board.calls.append(("cursor", self.board.key))
         for text in self.script.get(self.board.key, []):
             self.assembler.feed(text.encode())
 
@@ -416,3 +417,20 @@ def test_without_the_flag_the_control_firmware_is_written_first(world):
     go(world, ["h1"])
     first_p4_write = idx(world, lambda c: c[:2] == ("program", "p4"))
     assert "c6ctl" in world["calls"][first_p4_write][2]
+
+
+def test_both_cursors_are_armed_before_any_console_is_opened_for_the_scenario(world):
+    go(world, ["h1"])
+    calls = world["calls"]
+    program = idx(world, lambda c: c[:2] == ("program", "p4") and "c6ctl" not in c[2])
+    after = calls[program:]
+    first_console = next(i for i, c in enumerate(after) if c[0] == "console")
+    armed = {c[1] for c in after[:first_console] if c[0] == "cursor"}
+    assert armed == {"p4", "c6"}
+
+
+def test_the_p4_cursor_is_armed_before_its_console_is_opened(world):
+    go(world, ["h1"])
+    calls = world["calls"]
+    first_console_p4 = idx(world, lambda c: c[:2] == ("console", "p4"))
+    assert ("cursor", "p4") in calls[:first_console_p4]
