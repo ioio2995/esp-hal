@@ -74,8 +74,9 @@ its programming header. The C6 console is not forwarded through the P4.
 Start the P4 host after both images are installed. It holds C6 EN low while
 configuring the host, then releases it and waits for the slave firmware to boot.
 It sends the 80 initialization clocks, enumerates the C6, enables function 1 and waits for readiness and a receive
-credit. It writes one packet with CMD53 and polls the cumulative packet-length
-register until the echo is available. It reads the echo with CMD53 and checks
+credit. It writes one packet with CMD53, waits for IOR1 and polls the cumulative packet-length
+register until the echo is available. A FUNCTION_NUMBER refusal while polling means the slave
+has not declared function 1 ready again yet. It reads the echo with CMD53 and checks
 all 64 bytes.
 
 The C6 waits for the packet with `wait_received()`, validates it and explicitly
