@@ -255,14 +255,20 @@ def run(params, consent, scenarios, regions, build, build_dir, campaigns, orches
     state = {}
     args = (params, regions, build, build_dir, boards, campaigns, orchestrators)
     try:
-        # 1. The P4 is identified and backed up in ROM download; the C6 GPIO9 stays free.
-        gesture("put the P4 in ROM download; leave the C6 GPIO9 free (not grounded)")
-        _prepare("p4", params, consent, regions, boards, campaigns, orchestrators, outcome)
-        # 2. The P4 gets the C6 control firmware, then boots it.
-        _program("p4", inputs.CONTROL_SCENARIO, "host", *args, gesture, outcome, ttl, ask=False)
-        gesture("reset the P4 so that it boots the C6 control firmware")
-        _c6ctl_ready(state, boards, orchestrators, make_console, sleep, clock)
         prepared = set()
+        # With `control_firmware_running` the operator declares that the P4 already runs the
+        # control firmware: nothing is written to the P4 yet, and its backup is taken later, in
+        # ROM download, right before the first scenario image is written.
+        if params.get("control_firmware_running") is not True:
+            # 1. The P4 is identified and backed up in ROM download; the C6 GPIO9 stays free.
+            gesture("put the P4 in ROM download; leave the C6 GPIO9 free (not grounded)")
+            _prepare("p4", params, consent, regions, boards, campaigns, orchestrators, outcome)
+            prepared.add("p4")
+            # 2. The P4 gets the C6 control firmware, then boots it.
+            _program("p4", inputs.CONTROL_SCENARIO, "host", *args, gesture, outcome, ttl,
+                     ask=False)
+            gesture("reset the P4 so that it boots the C6 control firmware")
+        _c6ctl_ready(state, boards, orchestrators, make_console, sleep, clock)
         for scenario in scenarios:
             # 3. C6 phase, in one go, driven by the P4: GPIO9 grounded by hand, then EN reset.
             _c6_into_download(state, boards, orchestrators, make_console, gesture, sleep, clock)
@@ -275,6 +281,9 @@ def run(params, consent, scenarios, regions, build, build_dir, campaigns, orches
             # 4. P4 phase: its own reset reboots the C6, which is already programmed.
             state.pop("p4_console", None)
             gesture(f"{scenario}: put the P4 in ROM download (BOOT + reset)")
+            if "p4" not in prepared:
+                _prepare("p4", params, consent, regions, boards, campaigns, orchestrators, outcome)
+                prepared.add("p4")
             _program("p4", scenario, "host", *args, gesture, outcome, ttl, ask=False)
             lines = _observe(scenario, params, boards, campaigns, make_console, gesture, sleep,
                              clock, state)

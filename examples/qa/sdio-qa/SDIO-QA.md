@@ -140,6 +140,9 @@ and unobservable properties are reported separately.
   and its commands then time out with no byte (observed). The recipe therefore issues the
   `console` command on the C6 before each reset: it is the only way to leave that session, and
   the next loader command re-synchronizes. The C6 loader speed is its own setting (115200).
+* If the P4 already runs the control firmware, set `control_firmware_running: true` in the
+  parameters: the control image is not written again and the P4 backup (what it holds then) is
+  taken in ROM download right before its first scenario image.
 * A missing acknowledgement stops the campaign before any C6 write; only `C6 PING` is repeated,
   because it changes nothing. Do not probe the C6 beforehand.
 * The campaign stops at the first scenario that is not `PASS`; evidence is kept, nothing more

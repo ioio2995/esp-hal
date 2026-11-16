@@ -394,3 +394,25 @@ def test_h1_collection_waits_for_the_third_c6_session(world):
     assert lines["complete_observation"] is True
     assert len([x for x in lines["lines"] if x[0] == "C6" and x[2].startswith("RESULT")]) == 3
     assert outcome.error is None
+
+
+def test_running_control_firmware_skips_its_programming_and_the_first_p4_gestures(world):
+    world["params"]["control_firmware_running"] = True
+    go(world, ["h1"])
+    calls = world["calls"]
+    assert not [c for c in calls if c[0] == "program" and "c6ctl" in c[2]]
+    first_c6_write = idx(world, lambda c: c[:2] == ("program", "c6"))
+    assert not [c for c in calls[:first_c6_write] if c[0] in {"backup", "program"} and c[1] == "p4"]
+    labels = [c[1] for c in calls[:first_c6_write] if c[0] == "gesture"]
+    assert not any("P4 in ROM download" in t or "boots the C6 control" in t for t in labels)
+    # the P4 is backed up, twice, right before its scenario image
+    p4_backups = [i for i, c in enumerate(calls) if c[:2] == ("backup", "p4")]
+    p4_write = idx(world, lambda c: c[:2] == ("program", "p4"))
+    assert len(p4_backups) == 2 and max(p4_backups) < p4_write and min(p4_backups) > first_c6_write
+    assert calls[:first_c6_write].count(("uart.write", "p4", "C6 PING")) >= 1
+
+
+def test_without_the_flag_the_control_firmware_is_written_first(world):
+    go(world, ["h1"])
+    first_p4_write = idx(world, lambda c: c[:2] == ("program", "p4"))
+    assert "c6ctl" in world["calls"][first_p4_write][2]
