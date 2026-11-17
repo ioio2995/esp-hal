@@ -58,6 +58,27 @@ def _c6_sessions(lines):
     return sessions
 
 
+IDLE_REASON = "receive timed out"
+
+
+def _failures(session, expected_phases):
+    """Splits the failure lines of a C6 session into real failures and the idle timeout.
+
+    The C6 waits for the next control packet; once the P4 has finished with this configuration
+    nobody talks to it any more, and after its 30 s timeout it reports `receive timed out`. That
+    is the end of the session, not a failure of the measurement, but only when it comes AFTER the
+    last phase it served, with the same reason, and every phase the P4 ran was served."""
+    served = [_int(x.fields().get("id")) for x in session if x.kind == "bench_phase"]
+    last = max((i for i, x in enumerate(session) if x.kind == "bench_phase"), default=-1)
+    complete = set(expected_phases) <= set(served)
+    real, idle = [], []
+    for i, x in enumerate(session):
+        if not (x.kind == "fail" or "C6_FAIL" in x.body):
+            continue
+        (idle if complete and i > last and IDLE_REASON in x.body else real).append(x.body[:80])
+    return real, idle
+
+
 def _records(report):
     """Every measurement of the run: warm-ups, short windows and the confirmation."""
     for e in report["configs"].values():
@@ -250,13 +271,21 @@ def checks(report):
     # A configuration the P4 calls clean must have a quiet C6 session.
     sessions = report["c6_session_lines"]
     order = report["attempt_order"]
-    contradictions = []
+    contradictions, idle = [], []
     for index, cfg_id in enumerate(order):
         if index >= len(sessions):
             break
         e = configs.get(cfg_id)
-        if e and e["status"] == "CLEAN" and any(x.kind in ("fail",) or "C6_FAIL" in x.body for x in sessions[index]):
+        if not e or e["status"] != "CLEAN":
+            continue
+        phases = [w["phase"] for ee, mode, label, w in _records(report)
+                  if ee["id"] == cfg_id and label != "confirm"]
+        real, timeouts = _failures(sessions[index], phases)
+        if real:
             contradictions.append(cfg_id)
+        if timeouts:
+            idle.append(cfg_id)
+    report["c6_idle_timeouts"] = idle
     out.append(("no clean configuration has a failing C6 session", not contradictions, "check", contradictions))
     out.append(("one C6 session per attempted configuration", len(sessions) >= len(order), "require",
                 (len(sessions), len(order))))

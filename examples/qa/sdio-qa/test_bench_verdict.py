@@ -292,3 +292,43 @@ def test_confirmation_with_another_effective_frequency_or_width_fails():
         lines = [verdict.Line(x.board, 1, x.body.replace(old, new)) if x.kind == "bench_confirm" else x
                  for x in make(cfgs("clean", "clean"))]
         assert evaluate(lines).status == "FAIL", old
+
+
+def add_after_last_phase(lines, bodies, session=0):
+    """Inserts C6 lines after the last bench_phase of the given C6 session."""
+    boots = [i for i, x in enumerate(lines) if x.board == "C6" and x.kind == "boot"]
+    end = boots[session + 1] if session + 1 < len(boots) else len(lines)
+    last = max(i for i in range(boots[session], end) if lines[i].board == "C6" and lines[i].kind == "bench_phase")
+    return lines[:last + 1] + [L("C6", b) for b in bodies] + lines[last + 1:]
+
+
+IDLE = ["fail|receive timed out|TimeoutError", "RESULT|bench|C6_FAIL|receive timed out"]
+
+
+def test_the_c6_idle_timeout_after_the_last_phase_is_not_a_failure():
+    result = evaluate(add_after_last_phase(make(cfgs("clean")), IDLE))
+    assert result.status == "PASS", [c for c in result.checks if not c["ok"]]
+    assert result.report["c6_idle_timeouts"] == [0]
+
+
+def test_the_idle_timeout_is_accepted_per_session_in_a_multi_configuration_run():
+    lines = add_after_last_phase(make(cfgs("clean", "clean"), plan="qualified"), IDLE, session=0)
+    assert evaluate(lines).status == "PASS"
+
+
+def test_a_c6_failure_before_the_last_phase_stays_a_contradiction():
+    lines = make(cfgs("clean"))
+    first = next(i for i, x in enumerate(lines) if x.board == "C6" and x.kind == "bench_phase")
+    lines.insert(first + 1, L("C6", IDLE[0]))
+    assert evaluate(lines).status == "FAIL"
+
+
+def test_another_c6_failure_reason_after_the_last_phase_stays_a_contradiction():
+    lines = add_after_last_phase(make(cfgs("clean")), ["fail|content mismatch|ProtocolError", "RESULT|bench|C6_FAIL|content mismatch"])
+    assert evaluate(lines).status == "FAIL"
+
+
+def test_an_idle_timeout_does_not_excuse_a_phase_the_c6_never_served():
+    lines = make(cfgs("clean"), drop_c6_phase=2)
+    lines = add_after_last_phase(lines, IDLE)
+    assert evaluate(lines).status != "PASS"

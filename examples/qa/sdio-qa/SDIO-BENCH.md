@@ -99,7 +99,9 @@ warm-ups, the windows and the 30-second confirmation, requires the confirmed con
 computed best, the announced best and to carry the same parameters, derives the best error-free configuration itself and compares it to the
 one the firmware chose, checks the 30-second confirmation, and bounds the number of log lines (no
 per-packet logging). It writes `verdict-bench-<plan>.json` (every check, never truncated) and a
-markdown table `report-bench-<plan>.md` in the evidence folders. **The run is a PASS when it
+markdown table `report-bench-<plan>.md` in the evidence folders. **A C6 `receive timed out` that comes after the last phase it served (its 30 s idle timeout, when nobody
+talks to it any more) is the end of its session, not a failure, provided every phase the P4 ran in that
+session was served; any other C6 failure on a clean configuration stays a FAIL. The run is a PASS when it
 completed and the two logs agree; errors found on exploratory steps are findings in the report, not
 failures of the run. The exception is the reference configuration (configuration 0 of `smoke`,
 `qualified` and `full`: 400 kHz, 1 bit, 64 bytes), which must be clean in the three directions:
