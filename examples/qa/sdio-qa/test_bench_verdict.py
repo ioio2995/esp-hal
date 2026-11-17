@@ -369,62 +369,139 @@ def test_a_confirmation_phase_never_served_by_the_c6_is_not_a_pass():
     assert evaluate(lines).status != "PASS"
 
 
-def hs_run(shs_exposed="1", cccr="0x01", kinds=("clean", "clean", "clean", "clean", "clean")):
-    """A `hs` plan capture with the high speed findings of the C6 and of the P4."""
-    lines = tb_make(kinds)
-    first_boot = next(i for i, x in enumerate(lines) if x.board == "C6" and x.kind == "boot")
-    extra = []
-    if shs_exposed is not None:
-        extra.append(L("C6", f"bench_regs|when=exposed|shs={shs_exposed}|ehs=0|hinf_cfg_data1=0x00000004|slchost_conf=0x08000000"))
-    lines = lines[:first_boot + 1] + extra + lines[first_boot + 1:]
+HS_TABLE = [(400_000, 64), (20_000_000, 64), (40_000_000, 64), (20_000_000, 4096), (40_000_000, 4096)]
+CLEAN5 = ("clean",) * 5
+
+
+def hs_run(kinds=CLEAN5, shs_exposed="1", cccr="0x01", bit27=True, ehs_fast=True, ehs_slow=False,
+           negotiate=True, negotiation="accepted", regs=True, exposed=True, decode_lie=False):
+    """A `hs` plan capture, with the high speed findings of the C6 and of the P4."""
+    configs = [{"id": i, "hz": HS_TABLE[i][0], "width": 1, "size": HS_TABLE[i][1], "kind": kind}
+               for i, kind in enumerate(kinds)]
+    lines = make(configs, plan="hs")
+    hz = {}
+    for x in lines:
+        if x.board == "P4" and x.kind in ("bench_warmup", "bench_result", "bench_confirm"):
+            f = x.fields()
+            hz[int(f["phase"])] = int(f["actual_hz"])
+    slc = "0x08000000" if bit27 else "0x00000000"
+    rewritten = []
+    for x in lines:
+        if x.board == "C6" and x.kind == "bench_phase" and regs:
+            fast = hz.get(int(x.fields()["id"]), 0) > 25_000_000
+            ehs = ehs_fast if fast else ehs_slow
+            cfg = 0x4 | (0x8 if ehs else 0)
+            shown_ehs = 1 - int(ehs) if decode_lie else int(ehs)
+            x = verdict.Line(x.board, x.time_ms, x.body + f"|shs=1|ehs={shown_ehs}|hinf_cfg_data1=0x{cfg:08x}|slchost_conf={slc}")
+        rewritten.append(x)
+    lines = rewritten
+    if exposed:
+        first_boot = next(i for i, x in enumerate(lines) if x.board == "C6" and x.kind == "boot")
+        raw = "0x00000004" if shs_exposed == "1" else "0x00000000"
+        lines.insert(first_boot + 1, L("C6", f"bench_regs|when=exposed|shs={shs_exposed}|ehs=0|hinf_cfg_data1={raw}|slchost_conf={slc}"))
     if cccr is not None:
         lines.insert(2, L("P4", f"bench_caps|sdio_revision=0x32|card_capability=0x17|bus_interface=0x40|bus_speed={cccr}|fn1_block_size=0"))
+    if negotiate:
+        for (hz_, size), kind in zip(HS_TABLE, kinds):
+            if hz_ > 25_000_000 and kind == "clean":
+                after = "0x03" if negotiation == "accepted" else "0x01"
+                lines.insert(3, L("P4", f"bench_hs|requested_hz={hz_}|size={size}|cccr13_before=0x01|cccr13_after={after}|result={negotiation}"))
     return lines
-
-
-def tb_make(kinds):
-    table = [(400_000, 64), (20_000_000, 64), (40_000_000, 64), (20_000_000, 4096), (40_000_000, 4096)]
-    cfgs_ = [{"id": i, "hz": table[i][0], "width": 1, "size": table[i][1], "kind": kind} for i, kind in enumerate(kinds)]
-    return make(cfgs_, plan="hs")
-
-
-def test_the_hs_plan_passes_when_the_c6_advertises_high_speed_and_the_p4_reads_shs():
-    result = evaluate_plan("bench-hs", hs_run())
-    assert result.status == "PASS", [c for c in result.checks if not c["ok"]]
-    assert result.report["highspeed"]["c6_exposed"][0]["shs"] == "1"
-
-
-def test_the_hs_plan_fails_when_the_c6_does_not_advertise_high_speed():
-    assert evaluate_plan("bench-hs", hs_run(shs_exposed="0")).status == "FAIL"
-
-
-def test_the_hs_plan_fails_when_the_p4_reads_no_shs_bit_in_the_cccr():
-    assert evaluate_plan("bench-hs", hs_run(cccr="0x00")).status == "FAIL"
-
-
-def test_the_hs_plan_without_the_c6_registers_is_indeterminate():
-    assert evaluate_plan("bench-hs", hs_run(shs_exposed=None)).status == "INDETERMINATE"
-
-
-def test_the_hs_plan_without_the_p4_capability_line_is_indeterminate():
-    assert evaluate_plan("bench-hs", hs_run(cccr=None)).status == "INDETERMINATE"
-
-
-def test_an_error_at_40_mhz_is_a_result_of_the_hs_plan_not_a_failure():
-    kinds = ("clean", "clean", "error", "clean", "error")
-    result = evaluate_plan("bench-hs", hs_run(kinds=kinds))
-    assert result.status == "PASS", [c for c in result.checks if not c["ok"]]
-    assert result.report["configs"]["2"]["status"] == "ERROR"
-
-
-def test_the_hs_plan_reference_configuration_must_be_clean():
-    assert evaluate_plan("bench-hs", hs_run(kinds=("error", "clean", "clean", "clean", "clean"))).status == "FAIL"
-
-
-def test_the_hs_report_lists_the_registers_and_the_negotiation():
-    text = evaluate_plan("bench-hs", hs_run()).report["markdown"]
-    assert "High speed configuration" in text and "bench_regs" not in text and "shs" in text
 
 
 def evaluate_plan(scenario, lines):
     return verdict.evaluate(scenario, lines)[scenario]
+
+
+def hs(**kw):
+    return evaluate_plan("bench-hs", hs_run(**kw))
+
+
+def failed(result):
+    return [c["check"] for c in result.checks if not c["ok"]]
+
+
+def test_the_hs_plan_passes_when_everything_is_proven():
+    result = hs()
+    assert result.status == "PASS", failed(result)
+    assert result.report["highspeed"]["c6_exposed"][0]["shs"] == "1"
+
+
+def test_an_error_at_40_mhz_is_a_result_of_the_hs_plan_not_a_failure():
+    result = hs(kinds=("clean", "clean", "error", "clean", "error"))
+    assert result.status == "PASS", failed(result)
+    assert result.report["configs"]["2"]["status"] == "ERROR"
+
+
+def test_a_20_mhz_error_fails_the_plan_in_both_packet_sizes():
+    for kinds in (("clean", "error", "clean", "clean", "clean"), ("clean", "clean", "clean", "error", "clean")):
+        result = hs(kinds=kinds)
+        assert result.status == "FAIL", kinds
+        assert "every configuration below the high speed limit is clean in the three directions" in failed(result)
+
+
+def test_a_missing_20_mhz_configuration_is_indeterminate():
+    lines = hs_run()
+    lines = [x for x in lines if not (x.board == "P4" and "cfg=3|" in x.body)]
+    assert evaluate_plan("bench-hs", lines).status == "INDETERMINATE"
+
+
+def test_the_reference_configuration_must_be_clean():
+    assert hs(kinds=("error", "clean", "clean", "clean", "clean")).status == "FAIL"
+
+
+def test_the_c6_not_advertising_high_speed_at_exposure_fails():
+    assert hs(shs_exposed="0").status == "FAIL"
+
+
+def test_hspeed_con_en_not_set_after_exposure_fails():
+    result = hs(bit27=False)
+    assert result.status == "FAIL"
+    assert "HSPEED_CON_EN is set once the bus is exposed" in failed(result)
+
+
+def test_the_p4_reading_no_shs_bit_fails():
+    assert hs(cccr="0x00").status == "FAIL"
+
+
+def test_ehs_not_selected_in_the_40_mhz_phases_fails():
+    result = hs(ehs_fast=False)
+    assert result.status == "FAIL"
+    assert any("selects high speed (EHS) only in the phases above the limit" in c for c in failed(result))
+
+
+def test_ehs_selected_in_a_phase_at_or_below_the_limit_fails():
+    assert hs(ehs_slow=True).status == "FAIL"
+
+
+def test_a_decoded_value_that_contradicts_the_raw_word_fails():
+    result = hs(decode_lie=True)
+    assert result.status == "FAIL"
+    assert "the decoded SHS and EHS match the raw words of every phase" in failed(result)
+
+
+def test_missing_c6_registers_in_the_phases_are_indeterminate():
+    assert hs(regs=False).status == "INDETERMINATE"
+
+
+def test_missing_exposure_registers_are_indeterminate():
+    assert hs(exposed=False).status == "INDETERMINATE"
+
+
+def test_a_missing_p4_capability_line_is_indeterminate():
+    assert hs(cccr=None).status == "INDETERMINATE"
+
+
+def test_a_missing_ehs_negotiation_proof_is_indeterminate():
+    result = hs(negotiate=False)
+    assert result.status == "INDETERMINATE"
+    assert "the P4 negotiated high speed for every configuration measured above the limit" in failed(result)
+
+
+def test_a_refused_negotiation_on_a_clean_40_mhz_configuration_is_a_contradiction():
+    assert hs(negotiation="not_accepted").status == "FAIL"
+
+
+def test_the_hs_report_lists_the_registers_and_the_negotiation():
+    text = hs().report["markdown"]
+    assert "High speed configuration" in text and "EHS negotiation" in text

@@ -138,11 +138,23 @@ What is logged, outside every timed window: the C6 prints `bench_regs|when=expos
 exposes the bus (`HINF_CFG_DATA1`, `SLCHOST_CONF`, SHS and EHS decoded) and the same four values on
 every `bench_phase` line; the P4 prints `bench_hs|...` with CCCR `0x13` before and after it writes
 EHS, and the existing `bench_caps` line with the CCCR read at the qualified setting. The report lists
-them under "High speed configuration". The verdict **fails** if the C6 does not report SHS once the bus is
-exposed or the P4 reads no SHS bit in the CCCR (the driver change did not take effect), and is
-INDETERMINATE if either is missing. An error at 40 MHz is a result of the benchmark, not a failure of
-the plan: the configuration is classified and never retained as a reliable maximum. Nothing here tunes
-the sampling phase or the edge force bits.
+them under "High speed configuration".
+
+What the verdict requires (a demonstrated violation is a FAIL, a missing proof INDETERMINATE):
+- the qualified reference **and both 20 MHz configurations** (64 and 4096 bytes) are clean in the
+  three directions: the change must not degrade the modes that do not use high speed;
+- at exposure, from the raw words: SHS advertised (`HIGHSPEED_ENABLE`, bit 2), `HSPEED_CON_EN`
+  set (bit 27) and EHS not selected (bit 3); the decoded values match the raw words;
+- the P4 reads the SHS bit in the CCCR;
+- in **every measured phase** (warm-ups, windows and confirmation), EHS is selected by the host
+  only above 25 MHz, with SHS and `HSPEED_CON_EN` set in all of them, and the decoded values match
+  the raw words; a phase without C6 registers is missing proof;
+- for every configuration measured clean above 25 MHz, the P4 logged an accepted negotiation
+  (SHS before, EHS after in CCCR `0x13`); none happens at or below 25 MHz.
+
+An error at 40 MHz is a result of the benchmark, not a failure of the plan: the configuration is
+classified and never retained as a reliable maximum. Nothing here tunes the sampling phase or the
+edge force bits.
 
 ## The P4 boots by itself, one session per capture
 

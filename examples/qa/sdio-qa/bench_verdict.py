@@ -323,6 +323,99 @@ def analyze(lines):
     }
 
 
+HS_LIMIT_HZ = 25_000_000  # above it the host must select high speed (EHS)
+SHS_BIT, EHS_BIT, HSPEED_CON_EN_BIT = 1 << 2, 1 << 3, 1 << 27  # HINF_CFG_DATA1 and SLCHOST_CONF
+
+
+def _hex(value):
+    """A register word printed with `{:#010x}`; None when absent or malformed."""
+    try:
+        return int(value, 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hs_checks(report):
+    """Checks of the `hs` plan: the driver change must take effect and must not degrade the modes
+    that do not use high speed. Errors found at a frequency above the limit are results of the
+    benchmark and never fail the plan; a demonstrated violation is a FAIL, a missing proof
+    INDETERMINATE."""
+    hs, configs = report["highspeed"], report["configs"]
+    out = []
+    # 1. Every configuration that does not use high speed must be clean (400 kHz and 20 MHz).
+    slow = {i: e for i, e in configs.items() if 0 < e["actual_hz"] <= HS_LIMIT_HZ}
+    demonstrated = [i for i, e in slow.items() if e["status"] in ("ERROR", "UNSUPPORTED")]
+    missing = [i for i, e in slow.items() if e["status"] not in ("CLEAN", "ERROR", "UNSUPPORTED")]
+    expected_slow = 3  # 400 kHz and 20 MHz in 64 bytes, 20 MHz in 4096 bytes (+ the 400 kHz reference)
+    out.append(("every configuration below the high speed limit is clean in the three directions",
+                not demonstrated and not missing and len(slow) >= expected_slow,
+                "check" if demonstrated else "require",
+                {i: e["status"] for i, e in slow.items()}))
+
+    # 2. The registers the C6 reported.
+    exposed = hs["c6_exposed"]
+    if not exposed:
+        out.append(("the C6 reported its registers once the bus was exposed", False, "require", ""))
+    for f in exposed:
+        cfg, slc = _hex(f.get("hinf_cfg_data1")), _hex(f.get("slchost_conf"))
+        out.append(("the exposure registers are complete", cfg is not None and slc is not None, "require", f))
+        if cfg is None or slc is None:
+            continue
+        out.append(("SHS is advertised once the bus is exposed", bool(cfg & SHS_BIT), "check", hex(cfg)))
+        out.append(("HSPEED_CON_EN is set once the bus is exposed", bool(slc & HSPEED_CON_EN_BIT), "check", hex(slc)))
+        out.append(("EHS is not selected before the host writes it", not cfg & EHS_BIT, "check", hex(cfg)))
+        out.append(("the decoded SHS and EHS match the raw word at exposure",
+                    (f.get("shs") == "1") == bool(cfg & SHS_BIT) and (f.get("ehs") == "1") == bool(cfg & EHS_BIT),
+                    "check", f))
+    seen = list(hs["p4_cccr_speed"])
+    out.append(("the P4 reads SHS in the CCCR of the C6",
+                bool(seen) and all(_int(v.replace("0x", ""), 0, 16) & 1 for v in seen),
+                "check" if seen else "require", seen))
+
+    # 3. Every measured phase: the C6 registers agree with the frequency of its configuration.
+    wrong, unproven, mismatched = [], [], []
+    for e, mode, label, w in _records(report):
+        if e["status"] != "CLEAN" or e["actual_hz"] <= 0:
+            continue
+        regs = hs["c6_phases"].get(w["phase"])
+        where = (e["id"], mode, label)
+        cfg, slc = (_hex(regs.get("hinf_cfg_data1")), _hex(regs.get("slchost_conf"))) if regs else (None, None)
+        if cfg is None or slc is None:
+            unproven.append(where)
+            continue
+        wants_ehs = e["actual_hz"] > HS_LIMIT_HZ
+        if bool(cfg & EHS_BIT) != wants_ehs or not cfg & SHS_BIT or not slc & HSPEED_CON_EN_BIT:
+            wrong.append((where, {"ehs": bool(cfg & EHS_BIT), "shs": bool(cfg & SHS_BIT),
+                                  "hspeed_con_en": bool(slc & HSPEED_CON_EN_BIT), "wants_ehs": wants_ehs}))
+        if (regs.get("shs") == "1") != bool(cfg & SHS_BIT) or (regs.get("ehs") == "1") != bool(cfg & EHS_BIT):
+            mismatched.append(where)
+    out.append(("the C6 registers of every measured phase are proven", not unproven, "require", unproven[:5]))
+    out.append(("the C6 selects high speed (EHS) only in the phases above the limit, with SHS and "
+                "HSPEED_CON_EN set in all of them", not wrong, "check", wrong[:5]))
+    out.append(("the decoded SHS and EHS match the raw words of every phase", not mismatched, "check", mismatched[:5]))
+
+    # 4. The P4 negotiation agrees with what the C6 saw, for the configurations measured above the limit.
+    fast = {i: e for i, e in configs.items() if e["actual_hz"] > HS_LIMIT_HZ and e["status"] == "CLEAN"}
+    lacking, refused = [], []
+    for i, e in fast.items():
+        lines = [n for n in hs["negotiations"]
+                 if _int(n.get("requested_hz")) == e["requested_hz"] and _int(n.get("size")) == e["size"]]
+        if not lines:
+            lacking.append(i)
+        for n in lines:
+            before, after = _hex(n.get("cccr13_before")), _hex(n.get("cccr13_after"))
+            if n.get("result") != "accepted" or before is None or after is None or not before & 1 or not after & 2:
+                refused.append((i, n))
+    out.append(("the P4 negotiated high speed for every configuration measured above the limit",
+                not lacking, "require", lacking))
+    out.append(("every high speed negotiation was accepted", not refused, "check", refused[:3]))
+    quiet = [i for i, e in slow.items() if e["status"] == "CLEAN" and any(
+        _int(n.get("requested_hz")) == e["requested_hz"] and _int(n.get("size")) == e["size"]
+        for n in hs["negotiations"])]
+    out.append(("no high speed negotiation happens at or below the limit", not quiet, "check", quiet))
+    return out
+
+
 def checks(report):
     """Verdict checks `(name, ok, kind, detail)` computed from the report."""
     out = []
@@ -437,16 +530,7 @@ def checks(report):
         out.append(("a best configuration exists", report["best"] is not None,
                     "check" if demonstrated else "require", report["best"]))
     if report["plan"] == "hs":
-        hs = report["highspeed"]
-        # The purpose of this plan: the C6 slave advertises high speed once the bus is exposed.
-        # An error at 40 MHz is a result of the benchmark, never this check.
-        exposed = [f.get("shs") for f in hs["c6_exposed"]]
-        out.append(("the C6 reports that it advertises high speed once the bus is exposed",
-                    bool(exposed) and all(v == "1" for v in exposed), "check" if exposed else "require", exposed))
-        seen = list(hs["p4_cccr_speed"])
-        out.append(("the P4 reads SHS in the CCCR of the C6",
-                    bool(seen) and all(_int(v.replace("0x", ""), 0, 16) & 1 for v in seen),
-                    "check" if seen else "require", seen))
+        out += _hs_checks(report)
     lines_bound = 40 + n * (3 * (1 + max(m, 1)) + 4)
     out.append(("no per-packet logging", report["p4_bench_lines"] <= lines_bound, "check",
                 (report["p4_bench_lines"], lines_bound)))
