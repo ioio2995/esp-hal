@@ -8,8 +8,10 @@ Statuses: `PASS`, `FAIL` (a contract violation or a firmware-reported failure) a
 `INDETERMINATE` (evidence missing or truncated). `BLOCKED` is a campaign decision for a
 scenario that cannot be built or started and is never produced here.
 """
+import importlib.util
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 LINE = re.compile(r"QA\|(P4|C6)\|t=(\d+)\|(.*)")
 OK_REQUEST = "length=64|present=true|first_mismatch=None"
@@ -56,6 +58,11 @@ class LineAssembler:
 class Verdict:
     status: str = "PASS"
     checks: list = field(default_factory=list)
+    report: dict | None = None  # structured findings (benchmark), saved with the verdict
+
+    def as_dict(self):
+        """The complete verdict, with every check: nothing is truncated."""
+        return {"status": self.status, "checks": self.checks, "report": self.report}
 
     def check(self, name, ok, detail=""):
         self.checks.append({"check": name, "ok": bool(ok), "detail": str(detail)})
@@ -91,6 +98,9 @@ C6_RESULTS = {"h1": 3, "h2": 1, "h3": 1, "h4": 1, "h567": 1}
 
 def run_complete(scenario, lines):
     """True once the final session of the scenario reported on both boards."""
+    if scenario.startswith("bench-"):
+        # The C6 is reset for every configuration: only the P4 knows the plan is over.
+        return any(x.board == "P4" and x.kind == "RESULT" for x in lines)
     return (any(x.board == "P4" and x.kind == "RESULT" for x in lines)
             and sum(1 for x in lines if x.board == "C6" and x.kind == "RESULT")
             >= C6_RESULTS[scenario])
@@ -311,8 +321,31 @@ def _common_tail(verdict, lines):
     verdict.require("C6 result", bool(_of(lines, "C6", "RESULT", "C6_DONE")))
 
 
+def _bench_module():
+    spec = importlib.util.spec_from_file_location("sdio_qa_bench_verdict",
+                                                  Path(__file__).with_name("bench_verdict.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _bench(scenario, lines):
+    module = _bench_module()
+    report = module.analyze(lines)
+    v = Verdict()
+    for name, ok, kind, detail in module.checks(report):
+        (v.check if kind == "check" else v.require)(name, ok, detail)
+    shown = {k: val for k, val in report.items() if k not in ("c6_session_lines", "c6_phases")}
+    shown["configs"] = {str(k): val for k, val in report["configs"].items()}
+    shown["markdown"] = module.render_markdown(report)
+    v.report = shown
+    return v
+
+
 def evaluate(scenario, lines):
     """Returns `{test_id: Verdict}` for the scenario (`h567` yields h5, h6 and h7)."""
+    if scenario.startswith("bench-"):
+        return {scenario: _bench(scenario, lines)}
     if scenario == "h567":
         return _h567(lines)
     return {scenario: {"h1": _h1, "h2": _h2, "h3": _h3, "h4": _h4}[scenario](lines)}

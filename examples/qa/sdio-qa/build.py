@@ -6,7 +6,8 @@ Run from the repository root:
     python examples/qa/sdio-qa/build.py --output /path/to/private/builds
 
 Each scenario produces an ESP32-P4 host and an ESP32-C6 slave built by `cargo xtask build`
-with `SDIO_QA_SCENARIO` set. The app image is produced from the ELF with
+with `SDIO_QA_SCENARIO` set (`SDIO_BENCH_PLAN` for the `bench-*` benchmark scenarios, which use the
+separate `sdio-bench-*` firmwares). The app image is produced from the ELF with
 `espflash save-image --merge --skip-padding`: a FULL flash-prefix image that starts at flash
 address 0 and holds the second-stage bootloader, the partition table and the application. The
 bootloader and the table are the ones bundled with espflash, never a custom or erased one, and
@@ -28,11 +29,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 import importlib.util
 
-SCENARIOS = ("h1", "h2", "h3", "h4", "h567", "c6ctl")  # c6ctl has a P4 image only
+BENCH_PLANS = ("smoke", "qualified", "w1", "w4", "full")
+BENCH_SCENARIOS = tuple("bench-" + plan for plan in BENCH_PLANS)
+SCENARIOS = ("h1", "h2", "h3", "h4", "h567", "c6ctl") + BENCH_SCENARIOS  # c6ctl: P4 image only
 FIRMWARE = {
     "host": {"bin": "sdio-qa-host", "chip": "esp32p4", "target": "riscv32imafc-unknown-none-elf"},
     "slave": {"bin": "sdio-qa-slave", "chip": "esp32c6", "target": "riscv32imac-unknown-none-elf"},
 }
+BENCH_FIRMWARE = {
+    "host": dict(FIRMWARE["host"], bin="sdio-bench-host"),
+    "slave": dict(FIRMWARE["slave"], bin="sdio-bench-slave"),
+}
+
+
+def firmware_for(scenario):
+    """Binaries and the environment variable that selects the scenario or the benchmark plan."""
+    if scenario.startswith("bench-"):
+        return BENCH_FIRMWARE, "SDIO_BENCH_PLAN", scenario[len("bench-"):]
+    return FIRMWARE, "SDIO_QA_SCENARIO", scenario
+
+
 # Paths that make up the production driver. They must not differ from the qualified base.
 PRODUCTION_PATHS = [
     "esp-hal", "esp-hal-procmacros", "esp-metadata", "esp-metadata-generated", "esp-println",
@@ -107,10 +123,11 @@ def main():
         "artifacts": [],
     }
     for scenario in args.scenarios:
-        for role, spec in FIRMWARE.items():
+        firmware, variable, value = firmware_for(scenario)
+        for role, spec in firmware.items():
             if scenario == "c6ctl" and role == "slave":
                 continue
-            env = dict(os.environ, SDIO_QA_SCENARIO=scenario, RUST_BACKTRACE="0")
+            env = dict(os.environ, RUST_BACKTRACE="0", **{variable: value})
             command = ["cargo", "xtask", "build", spec["bin"], spec["chip"]]
             run(command, root, env)
             built = root / "target" / spec["target"] / "release" / spec["bin"]
@@ -125,7 +142,7 @@ def main():
             layout = _layout_module().parse(image.read_bytes(), spec["chip"])
             manifest["artifacts"].append({
                 "scenario": scenario, "role": role, "chip": spec["chip"],
-                "target": spec["target"], "scenario_env": f"SDIO_QA_SCENARIO={scenario}",
+                "target": spec["target"], "scenario_env": f"{variable}={value}",
                 "command": " ".join(command), "elf": str(elf.relative_to(args.output)),
                 "elf_sha256": sha256(elf), "image": str(image.relative_to(args.output)),
                 "image_kind": "full-flash-prefix", "flash_size_arg": flash_size,

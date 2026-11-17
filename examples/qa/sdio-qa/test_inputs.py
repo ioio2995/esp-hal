@@ -141,3 +141,25 @@ def test_control_image_is_not_a_consented_scenario(case):
     consent["scenarios"] = ["c6ctl"]
     with pytest.raises(inputs.InputError, match="known scenarios"):
         inputs.validate(params, consent, build, directory)
+
+
+def test_benchmark_scenarios_need_a_long_enough_observation_time(case):
+    params, consent, build, directory = case
+    consent["scenarios"] = ["bench-qualified"]
+    with pytest.raises(inputs.InputError, match="scenario_timeouts.bench-qualified"):
+        inputs.validate(params, consent, build, directory)
+    params["scenario_timeouts"] = {"bench-qualified": inputs.BENCH_TIMEOUT_S["bench-qualified"] - 1}
+    with pytest.raises(inputs.InputError, match="at least"):
+        inputs.validate(params, consent, build, directory)
+    params["scenario_timeouts"] = {"bench-qualified": inputs.BENCH_TIMEOUT_S["bench-qualified"]}
+    scenarios, regions = inputs.validate(params, consent, build, directory)
+    assert scenarios == ["bench-qualified"] and regions["p4"][1] > 0
+
+
+def test_benchmark_images_are_validated_like_the_others(case):
+    params, consent, build, directory = case
+    consent["scenarios"] = ["bench-smoke"]
+    params["scenario_timeouts"] = {"bench-smoke": 90}
+    build["artifacts"] = [a for a in build["artifacts"] if not (a["scenario"] == "bench-smoke" and a["role"] == "slave")]
+    with pytest.raises(inputs.InputError, match="bench-smoke"):
+        inputs.validate(params, consent, build, directory)

@@ -111,7 +111,7 @@ def world(tmp_path):
               "c6": {"device": "c", "chip": "esp32c6", "flash_size": 1 << 23}}
     build = {"artifacts": [{"scenario": s, "role": r, "image": f"{s}-{r}.bin", "elf_sha256": "0",
                             "image_sha256": "0", "image_size": 4096, "layout": LAYOUT}
-                           for s in ("h1", "h2") for r in ("host", "slave")]
+                           for s in ("h1", "h2", "bench-smoke") for r in ("host", "slave")]
              + [{"scenario": "c6ctl", "role": "host", "image": "c6ctl-host.bin", "elf_sha256": "0",
                  "image_sha256": "0", "image_size": 4096, "layout": LAYOUT}]}
     w = {"calls": calls, "params": params, "build": build, "consent": {}, "pending": [],
@@ -436,3 +436,13 @@ def test_the_p4_cursor_is_armed_before_its_console_is_opened(world):
     calls = world["calls"]
     first_console_p4 = idx(world, lambda c: c[:2] == ("console", "p4"))
     assert ("cursor", "p4") in calls[:first_console_p4]
+
+
+def test_a_benchmark_scenario_uses_its_own_timeout_and_saves_the_complete_verdict(world):
+    world["params"]["scenario_timeout_seconds"] = 1
+    world["params"]["scenario_timeouts"] = {"bench-smoke": 100}
+    outcome = go(world, ["bench-smoke"])
+    full = json.loads((world["campaigns"]["p4"].directory / "verdict-bench-smoke.json").read_text())
+    assert full["status"] == "INDETERMINATE" and len(full["checks"]) > 3
+    assert outcome.failed_verdicts == {"bench-smoke": "INDETERMINATE"}
+    assert ("restore", "c6") in world["calls"]  # the usual cleanup still runs

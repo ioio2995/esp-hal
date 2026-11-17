@@ -195,7 +195,8 @@ def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, 
         for key in ("c6", "p4"):
             boards[key].console()
         gesture(f"{scenario}: reset the P4 so that it boots the scenario (it resets the C6 itself)")
-        deadline = clock() + params.get("scenario_timeout_seconds", 90)
+        deadline = clock() + params.get("scenario_timeouts", {}).get(
+            scenario, params.get("scenario_timeout_seconds", 90))
         while clock() < deadline:
             for console in consoles.values():
                 console.poll()
@@ -294,6 +295,12 @@ def run(params, consent, scenarios, regions, build, build_dir, campaigns, orches
                              clock, state)
             for test_id, result in verdict.evaluate(scenario, lines).items():
                 outcome.verdicts[test_id] = result
+                for key in ("p4", "c6"):
+                    # The complete verdict, not the truncated evidence of the verdict table.
+                    campaigns[key].write(f"verdict-{test_id}.json", result.as_dict())
+                    if result.report and result.report.get("markdown"):
+                        (campaigns[key].directory / f"report-{test_id}.md").write_text(
+                            result.report["markdown"])
                 campaigns["p4"].result(test_id, result.status,
                                        preconditions=f"build {params['expected_source_sha']}",
                                        evidence=str(result.checks)[:2000], incidents="",

@@ -15,6 +15,7 @@ differs from the qualified base commit and records that proof in the build manif
 | `../src/bin/sdio-qa-slave.rs` | C6 firmware, all scenarios |
 | `../src/bin/sdio-qa-host.rs` | P4 firmware, all scenarios |
 | `../src/sdio_qa.rs` | Shared patterns, counters and scenario selection (host-tested arithmetic) |
+| `SDIO-BENCH.md`, `bench_verdict.py`, `../src/bin/sdio-bench-*.rs`, `../src/sdio_bench.rs` | Throughput benchmark, separate from H0-H7 (see `SDIO-BENCH.md`) |
 | `build.py` | Reproducible build of the five scenario pairs and `build-manifest.json` |
 | `verdict.py`, `test_verdict.py` | Console parsing and verdict logic; software tests on synthetic logs |
 | `inputs.py`, `test_inputs.py` | Refusal of templates, unreviewed builds and mismatched consent |
