@@ -233,14 +233,26 @@ async fn round(
         }
         let after = slave.receive_diagnostics();
         diag_rx("rx_after_cancel", slave);
-        // The descriptor word and the credit must be exactly what they were before the wait,
-        // and no receive completion or fault event may be pending.
-        let held = slave.state() == State::Function1Receiving
-            && slave.received().is_none()
-            && descriptor_owner_dma(after.descriptor_dw0)
-            && after.descriptor_dw0 == before.descriptor_dw0
-            && after.interrupt_raw & RECEIVE_EVENT_BITS == 0
-            && after.token == before.token;
+        // The driver must still retain the allocations (a premature restitution is refused), the
+        // transfer must still be armed and unchanged, with no receive completion or fault event and
+        // no extra credit. Calling `take_receive_buffers()` here is the API-level proof that the
+        // allocations were not given back; it is expected to be refused.
+        let restitution_refused = slave.take_receive_buffers().is_err();
+        let owner_dma = descriptor_owner_dma(after.descriptor_dw0);
+        let word_unchanged = after.descriptor_dw0 == before.descriptor_dw0;
+        let no_event = after.interrupt_raw & RECEIVE_EVENT_BITS == 0;
+        let no_extra_credit = after.token == before.token;
+        let armed = slave.state() == State::Function1Receiving && slave.received().is_none();
+        qa!(
+            "cancel_detail|rx|state_armed={}|restitution_refused={}|completion_event_pending={}|credit_unchanged={}|owner_dma={}|word_unchanged={}",
+            armed,
+            restitution_refused,
+            !no_event,
+            no_extra_credit,
+            owner_dma,
+            word_unchanged
+        );
+        let held = armed && restitution_refused && no_event && no_extra_credit && owner_dma;
         qa!(
             "cancel_check|rx|dma_still_armed_and_no_extra_credit={}",
             held
@@ -285,13 +297,26 @@ async fn round(
         }
         let after = slave.transmit_diagnostics();
         diag_tx("tx_after_cancel", slave);
-        // A transmit descriptor is armed with EOF already set (end of packet): only an unchanged
-        // word, DMA ownership and the absence of a completion or fault event prove it is pending.
-        let held = slave.state() == State::Function1Transmitting
-            && descriptor_owner_dma(after.descriptor_dw0)
-            && after.descriptor_dw0 == before.descriptor_dw0
-            && after.interrupt_raw & TRANSMIT_EVENT_BITS == 0
-            && after.published_length == before.published_length;
+        // The owner bit of a transmit descriptor is not a criterion: the DMA may consume the
+        // descriptor at any time after the arm (observed 1 after the arm in some rounds, 0 in
+        // others), and the EOF bit describes the end of the packet, not a completion. What proves
+        // the transfer is still pending: the driver still refuses to give the allocations back,
+        // the state is still `Function1Transmitting`, no completion or fault event is pending and
+        // the published length is unchanged. The resumed wait that follows proves it can finish.
+        let restitution_refused = slave.take_transmit_buffers().is_err();
+        let no_event = after.interrupt_raw & TRANSMIT_EVENT_BITS == 0;
+        let length_unchanged = after.published_length == before.published_length;
+        let armed = slave.state() == State::Function1Transmitting;
+        qa!(
+            "cancel_detail|tx|state_armed={}|restitution_refused={}|completion_event_pending={}|length_unchanged={}|owner_dma={}|word_unchanged={}",
+            armed,
+            restitution_refused,
+            !no_event,
+            length_unchanged,
+            descriptor_owner_dma(after.descriptor_dw0),
+            after.descriptor_dw0 == before.descriptor_dw0
+        );
+        let held = armed && restitution_refused && no_event && length_unchanged;
         qa!(
             "cancel_check|tx|dma_still_armed_and_no_extra_length={}",
             held

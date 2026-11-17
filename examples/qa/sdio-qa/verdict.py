@@ -209,6 +209,18 @@ def _h4(lines):
     for direction in ("rx", "tx"):
         v.require(f"{direction} wait started then cancelled",
                   len(_of(lines, "C6", "cancel", f"|{direction}|")) == 1)
+        detail = _of(lines, "C6", "cancel_detail", f"|{direction}|")
+        v.require(f"{direction} cancellation detail reported", len(detail) == 1, len(detail))
+        if detail:
+            f = detail[0].fields()
+            unchanged = "credit_unchanged" if direction == "rx" else "length_unchanged"
+            # The DMA owner bit is deliberately not a criterion: it varies after an arm.
+            v.check(f"{direction} transfer still armed and retained by the driver",
+                    f.get("state_armed") == "true" and f.get("restitution_refused") == "true",
+                    {k: f.get(k) for k in ("state_armed", "restitution_refused")})
+            v.check(f"{direction} no completion event, nothing published or credited",
+                    f.get("completion_event_pending") == "false" and f.get(unchanged) == "true",
+                    {k: f.get(k) for k in ("completion_event_pending", unchanged)})
         v.sequence(f"{direction} DMA unchanged, no completion event, no extra credit/length",
                    [x.body.rsplit("=", 1)[1] for x in _of(lines, "C6", "cancel_check",
                                                           f"|{direction}|")], ["true"])

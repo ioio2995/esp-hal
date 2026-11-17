@@ -75,11 +75,19 @@ def h3():
     return log(*rows, *end("h3"))
 
 
+RX_DETAIL = ("cancel_detail|rx|state_armed=true|restitution_refused=true|completion_event_pending=false|"
+             "credit_unchanged=true|owner_dma=true|word_unchanged=true")
+TX_DETAIL = ("cancel_detail|tx|state_armed=true|restitution_refused=true|completion_event_pending=false|"
+             "length_unchanged=true|owner_dma=false|word_unchanged=false")
+
+
 def h4():
     rows = boots("h4") + [("C6", "cancel|rx|wait pending then cancelled"),
+        ("C6", RX_DETAIL),
         ("C6", "cancel_check|rx|dma_still_armed_and_no_extra_credit=true"),
         ("C6", OK_RX.format(k=0)),
         ("C6", "cancel|tx|wait pending then cancelled"),
+        ("C6", TX_DETAIL),
         ("C6", "cancel_check|tx|dma_still_armed_and_no_extra_length=true"),
         ("C6", "tx_done|k=0|dma_bytes=64")] + p4_round(0, waits=(310, 305))
     return log(*rows, *end("h4"))
@@ -254,3 +262,30 @@ def test_h3_bytes_inside_the_word_rounding_are_only_an_observation():
 def test_h3_without_the_full_invalidation_does_not_pass():
     assert _h3_with_tail(TAIL_OK.replace("invalidated_after_dma=256", "invalidated_after_dma=65")) == "FAIL"
     assert _h3_with_tail(TAIL_OK.replace("invalidated_after_dma=256", "invalidated_after_dma=0")) == "FAIL"
+
+
+def _h4_with(old, new):
+    rows = [verdict.Line(x.board, 1, x.body.replace(old, new)) for x in h4()]
+    return verdict.evaluate("h4", rows)["h4"].status
+
+
+def test_h4_owner_bit_and_unchanged_word_are_not_criteria():
+    # TX_DETAIL already reports owner_dma=false and word_unchanged=false after the arm.
+    assert verdict.evaluate("h4", h4())["h4"].status == "PASS"
+
+
+def test_h4_premature_restitution_fails():
+    assert _h4_with("tx|state_armed=true|restitution_refused=true", "tx|state_armed=true|restitution_refused=false") == "FAIL"
+    assert _h4_with("rx|state_armed=true|restitution_refused=true", "rx|state_armed=true|restitution_refused=false") == "FAIL"
+
+
+def test_h4_completion_event_or_extra_length_fails():
+    assert _h4_with("tx|state_armed=true|restitution_refused=true|completion_event_pending=false",
+                    "tx|state_armed=true|restitution_refused=true|completion_event_pending=true") == "FAIL"
+    assert _h4_with("length_unchanged=true", "length_unchanged=false") == "FAIL"
+    assert _h4_with("credit_unchanged=true", "credit_unchanged=false") == "FAIL"
+
+
+def test_h4_missing_cancel_detail_is_indeterminate():
+    rows = [x for x in h4() if x.kind != "cancel_detail"]
+    assert verdict.evaluate("h4", rows)["h4"].status == "INDETERMINATE"
