@@ -114,6 +114,9 @@ def reanalyze(p4_dir, c6_dir, scenario, *, p4_session=None, identity=None, now=N
         "limits": ["Session boundaries are the boot banners of the saved capture; the raw log is kept whole.",
                    "The C6 sessions of a P4 session are counted from the earlier sessions (one reset per "
                    "attempted configuration, confirmation included), not read from a link in the logs.",
+                   "The association is inferred from the count and the order of the sessions, not proven: the "
+                   "phase cross-check does not guarantee to detect a substitution (two C6 sessions with the "
+                   "same identifiers, sizes and counters are indistinguishable).",
                    "Only the selected session is judged; the others are listed, not evaluated."],
         "reanalysed_verdict": {"status": status, "checks": checks,
                                "failed_checks": [c["check"] for c in checks if not c["ok"]],

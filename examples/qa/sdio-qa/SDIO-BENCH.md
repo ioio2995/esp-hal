@@ -149,8 +149,12 @@ make the run a pass of the revision that produced it.
   reset, so they are the next C6 sessions after those of the earlier P4 sessions.
 - **Ambiguity is INDETERMINATE, with nothing evaluated:** an earlier P4 session that is truncated
   or without banner (its resets cannot be counted), a missing C6 session, an unknown session number.
-  A foreign C6 reset ahead of the plan shifts the association: the phase cross-checks then fail to
-  match, so it never gives a PASS, but this is a limit of counting rather than a proof.
+- **The association is inferred, not proven.** It comes from the count and the order of the sessions
+  in the capture, and the capture must add up as a whole. The cross-check of the phases (identifiers,
+  sizes, counters) does **not** guarantee to detect a substitution: two C6 sessions with the same
+  identifiers, sizes and counters are indistinguishable. A reanalysis reads "this session, with the
+  C6 sessions that the order and the count attribute to it", never "these C6 logs are proven to belong
+  to it". Every report that quotes a reanalysis must say so.
 
 ## Limits to keep in mind
 
