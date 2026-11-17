@@ -2,6 +2,9 @@
 
 #![no_std]
 
+pub mod sdio_bench;
+pub mod sdio_qa;
+
 use core::ops::Range;
 
 use esp_bootloader_esp_idf::partitions;
