@@ -115,7 +115,9 @@ observation time (`scenario_timeouts`, at least 90 s for `smoke`, 600 for `quali
 `w1`, 1800 for `w4`, 3300 for `full`). Run `smoke` first, then `qualified`, before the ladders.
 The benchmark is long: keep the PC awake and the grants alive. The campaign renews both
 reservations every 300 s during an observation; a failed renewal stops the observation, keeps the
-partial evidence and runs the cleanup.
+partial evidence and runs the cleanup. At the end, once the boards are restored, the campaign asks the
+operator to revoke the local grants and waits up to 5 minutes for them to disappear (`Campaign.close()`
+refuses an active grant); it never revokes a grant itself and reports one that stays active.
 
 ## Limits to keep in mind
 

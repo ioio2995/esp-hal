@@ -250,6 +250,37 @@ def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, 
     return consoles["p4"].assembler.lines + consoles["c6"].assembler.lines
 
 
+REVOKE_WAIT_S = 300  # how long the operator has to revoke the local grants before the close
+
+
+def _active_grants(params, campaigns):
+    """Boards whose local grant is still active. Remote clients can only observe it."""
+    active = []
+    for key in ("p4", "c6"):
+        client = getattr(campaigns[key], "client", None)
+        if client is not None and client.device(params[key]["device"])["privileged_seconds"] > 0:
+            active.append(key)
+    return active
+
+
+def _await_revoked(params, campaigns, gesture, outcome, sleep, clock):
+    """`Campaign.close()` refuses an active grant: only the operator can revoke it. Ask, then
+    observe; a grant that stays active is reported, never revoked or worked around."""
+    try:
+        if not _active_grants(params, campaigns):
+            return
+        gesture("revoke the local grant of both boards now (P4 and C6)")
+        deadline = clock() + REVOKE_WAIT_S
+        while _active_grants(params, campaigns):
+            if clock() >= deadline:
+                for key in _active_grants(params, campaigns):
+                    outcome.cleanup_errors.append((key, "GrantStillActive"))
+                return
+            sleep(1)
+    except Exception as error:  # noqa: BLE001 - reported; the close then states the grant itself
+        outcome.cleanup_errors.append(("grants", type(error).__name__))
+
+
 def _cleanup(params, boards, campaigns, orchestrators, gesture, outcome, ttl, state, make_console,
              sleep, clock):
     # Only boards on which a mutation was engaged are restored; a backup alone is not a reason.
@@ -279,6 +310,7 @@ def _cleanup(params, boards, campaigns, orchestrators, gesture, outcome, ttl, st
                 state.pop("p4_console", None)
         except Exception as error:  # noqa: BLE001 - reported, never hidden, never retried
             outcome.cleanup_errors.append((key, type(error).__name__))
+    _await_revoked(params, campaigns, gesture, outcome, sleep, clock)
     for key, campaign in campaigns.items():
         try:
             campaign.close()

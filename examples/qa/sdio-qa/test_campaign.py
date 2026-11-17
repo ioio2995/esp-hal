@@ -518,3 +518,41 @@ def test_a_benchmark_drains_the_c6_pages_that_arrived_after_the_p4_finished(worl
     assert outcome.error is None
     saved = json.loads((world["campaigns"]["c6"].directory / "uart-bench-smoke-lines.json").read_text())
     assert len([x for x in saved["lines"] if "bench_phase" in x[2]]) == 7  # nothing left behind
+
+
+class GrantClient:
+    """Reports a local grant until the operator "revokes" it (the gesture)."""
+
+    def __init__(self, world, stays=False):
+        self.world, self.stays = world, stays
+
+    def device(self, device):
+        revoked = any(c[0] == "gesture" and "revoke the local grant" in c[1] for c in self.world["calls"])
+        return {"privileged_seconds": 0 if revoked and not self.stays else 900}
+
+
+def test_the_operator_is_asked_to_revoke_the_grants_before_the_close(world):
+    for key in ("p4", "c6"):
+        world["campaigns"][key].client = GrantClient(world)
+    outcome = go(world, ["bench-smoke"])
+    labels = [c[1] for c in world["calls"] if c[0] == "gesture"]
+    assert labels[-1].startswith("revoke the local grant") and outcome.cleanup_errors == []
+    assert all(c.closed for c in world["campaigns"].values())
+
+
+def test_a_grant_that_stays_active_is_reported_and_never_worked_around(world):
+    for key in ("p4", "c6"):
+        world["campaigns"][key].client = GrantClient(world, stays=True)
+    outcome = go(world, ["bench-smoke"])
+    assert ("p4", "GrantStillActive") in outcome.cleanup_errors and ("c6", "GrantStillActive") in outcome.cleanup_errors
+    assert all(c.closed for c in world["campaigns"].values())  # the evidence is still closed
+
+
+def test_no_revoke_request_without_an_active_grant(world):
+    class Quiet:
+        def device(self, device):
+            return {"privileged_seconds": 0}
+    for key in ("p4", "c6"):
+        world["campaigns"][key].client = Quiet()
+    go(world, ["bench-smoke"])
+    assert not any(c[0] == "gesture" and "revoke the local grant" in c[1] for c in world["calls"])
