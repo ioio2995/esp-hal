@@ -332,3 +332,37 @@ def test_an_idle_timeout_does_not_excuse_a_phase_the_c6_never_served():
     lines = make(cfgs("clean"), drop_c6_phase=2)
     lines = add_after_last_phase(lines, IDLE)
     assert evaluate(lines).status != "PASS"
+
+
+def test_a_c6_failure_in_the_confirmation_session_fails_the_run():
+    lines = add_after_last_phase(make(cfgs("clean")), ["fail|content mismatch|ProtocolError",
+                                                       "RESULT|bench|C6_FAIL|content mismatch"], session=1)
+    result = evaluate(lines)
+    assert result.status == "FAIL"
+    assert any(not c["ok"] and "confirmation" in c["check"] for c in result.checks)
+
+
+def test_the_idle_timeout_after_the_confirmation_is_accepted():
+    result = evaluate(add_after_last_phase(make(cfgs("clean")), IDLE, session=1))
+    assert result.status == "PASS" and result.report["c6_idle_timeouts"] == ["confirmation"]
+
+
+def test_a_c6_failure_in_the_middle_of_the_confirmation_fails():
+    lines = make(cfgs("clean"))
+    boots = [i for i, x in enumerate(lines) if x.board == "C6" and x.kind == "boot"]
+    lines.insert(boots[1] + 1, L("C6", IDLE[0]))
+    assert evaluate(lines).status == "FAIL"
+
+
+def test_a_confirmation_without_its_own_c6_session_is_indeterminate():
+    lines = make(cfgs("clean"))
+    boots = [i for i, x in enumerate(lines) if x.board == "C6" and x.kind == "boot"]
+    lines = lines[:boots[1]]  # the confirmation session and everything after it is gone
+    assert evaluate(lines).status == "INDETERMINATE"
+
+
+def test_a_confirmation_phase_never_served_by_the_c6_is_not_a_pass():
+    lines = make(cfgs("clean"))
+    lines = [x for x in lines if not (x.board == "C6" and x.kind == "bench_phase" and "count=6000" in x.body
+                                      and "mode=c6_to_p4" in x.body)]
+    assert evaluate(lines).status != "PASS"

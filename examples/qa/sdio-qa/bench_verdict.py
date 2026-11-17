@@ -285,10 +285,25 @@ def checks(report):
             contradictions.append(cfg_id)
         if timeouts:
             idle.append(cfg_id)
+    # The confirmation runs in its own C6 session, right after the ones of the configurations.
+    confirmation = report["confirmation"]
+    confirm_expected = report["confirm_ms"] > 0 and report["best"] is not None
+    confirm_session = sessions[len(order)] if len(sessions) > len(order) else None
+    if confirmation and confirm_session is not None:
+        phases = [m["phase"] for m in confirmation["modes"].values()]
+        real, timeouts = _failures(confirm_session, phases)
+        if real:
+            contradictions.append("confirmation")
+        if timeouts:
+            idle.append("confirmation")
     report["c6_idle_timeouts"] = idle
-    out.append(("no clean configuration has a failing C6 session", not contradictions, "check", contradictions))
+    out.append(("no clean configuration, nor the confirmation, has a failing C6 session", not contradictions,
+                "check", contradictions))
     out.append(("one C6 session per attempted configuration", len(sessions) >= len(order), "require",
                 (len(sessions), len(order))))
+    if confirm_expected:
+        out.append(("the confirmation has its own C6 session", confirm_session is not None, "require",
+                    (len(sessions), len(order))))
 
     out.append(("summary reported", report["summary_present"], "require", ""))
     # A disagreement caused by lines that are missing is missing evidence, not a contradiction.

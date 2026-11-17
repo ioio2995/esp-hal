@@ -121,6 +121,15 @@ partial evidence and runs the cleanup. At the end, once the boards are restored,
 operator to revoke the local grants and waits up to 5 minutes for them to disappear (`Campaign.close()`
 refuses an active grant); it never revokes a grant itself and reports one that stays active.
 
+## Re-reading captures without flashing again
+
+A change of the evaluator does not need a new hardware run. `reanalyze.py --p4 <evidence p4>
+--c6 <evidence c6> --scenario bench-smoke` re-evaluates the saved captures and adds
+`reanalysis-<scenario>-<evaluator commit>.json` to the P4 evidence: firmware source SHA that ran,
+evaluator commit and file digests, SHA-256 of every raw input, the original verdict and the new
+one. The original verdict is kept untouched and an existing reanalysis is never overwritten. It does
+not make the run a pass of the revision that produced it.
+
 ## Limits to keep in mind
 
 - One run per configuration after warm-up; three windows give a spread, not a statistical bound.
