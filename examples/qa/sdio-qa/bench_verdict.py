@@ -44,6 +44,82 @@ def _measurement(fields):
     }
 
 
+def p4_sessions(lines):
+    """The P4 lines split at every boot banner: one entry per boot of the P4 firmware.
+
+    Lines that come before the first banner (a capture that missed it) form a session of their
+    own, so that they are never silently attached to the next one. Each entry lists its lines and
+    whether it reached the end marker and how many configurations it attempted."""
+    sessions = []
+    for x in lines:
+        if x.board != "P4":
+            continue
+        if x.kind == "boot" or not sessions:
+            sessions.append({"lines": [], "headless": x.kind != "boot"})
+        sessions[-1]["lines"].append(x)
+    for session in sessions:
+        session["complete"] = any(x.kind == "RESULT" for x in session["lines"])
+        session["configurations"] = sum(1 for x in session["lines"] if x.kind == "bench_config")
+    return sessions
+
+
+def c6_sessions_with_boot(lines):
+    """The C6 lines split at every boot banner, the banner included. Lines before the first
+    banner are not part of any session."""
+    sessions = []
+    for x in lines:
+        if x.board != "C6":
+            continue
+        if x.kind == "boot":
+            sessions.append([])
+        if sessions:
+            sessions[-1].append(x)
+    return sessions
+
+
+class AmbiguousAssociation(ValueError):
+    """The C6 sessions of a P4 session cannot be determined from the evidence."""
+
+
+def select_session(lines, number):
+    """Returns `(lines_of_the_session, association)` for the 1-based P4 session `number`.
+
+    The P4 resets the C6 once for every configuration it attempts (and once for the
+    confirmation), and prints `bench_config` after each reset: the C6 sessions of a P4 session
+    are therefore the next `configurations` C6 sessions after those of the earlier P4 sessions.
+    That count is only reliable when every earlier P4 session reached its end marker: otherwise
+    a reset may or may not have happened before the capture stopped, and the association is
+    ambiguous."""
+    sessions = p4_sessions(lines)
+    c6 = c6_sessions_with_boot(lines)
+    if not 1 <= number <= len(sessions):
+        raise AmbiguousAssociation(f"there are {len(sessions)} P4 sessions, not {number}")
+    chosen = sessions[number - 1]
+    if chosen["headless"]:
+        raise AmbiguousAssociation("the selected P4 session has no boot banner")
+    before = sessions[:number - 1]
+    if any(not earlier["complete"] or earlier["headless"] for earlier in before):
+        raise AmbiguousAssociation("an earlier P4 session is truncated or headless: "
+                                   "its C6 resets cannot be counted")
+    first = sum(earlier["configurations"] for earlier in before)
+    count = chosen["configurations"]
+    if count == 0:
+        raise AmbiguousAssociation("the selected P4 session attempted no configuration")
+    if first + count > len(c6):
+        raise AmbiguousAssociation(f"the selected P4 session needs C6 sessions {first + 1}..{first + count} "
+                                   f"but only {len(c6)} were captured")
+    association = {"p4_session": number, "p4_sessions": len(sessions),
+                   "p4_session_complete": chosen["complete"], "c6_sessions_total": len(c6),
+                   "c6_sessions": list(range(first + 1, first + count + 1)),
+                   "other_p4_sessions": [{"session": i + 1, "complete": s["complete"],
+                                          "configurations": s["configurations"], "lines": len(s["lines"])}
+                                         for i, s in enumerate(sessions) if i != number - 1]}
+    kept = list(chosen["lines"])
+    for session in c6[first:first + count]:
+        kept += session
+    return kept, association
+
+
 def _c6_sessions(lines):
     """C6 lines split at every boot banner: one session per attempted configuration."""
     sessions, current = [], None
@@ -331,10 +407,15 @@ def checks(report):
     if report["plan"] in ("smoke", "qualified", "full"):
         # Configuration 0 of these plans is the qualified one (400 kHz, 1 bit, 64 bytes). A run
         # that cannot measure it cleanly in the three directions must not let the campaign go on.
+        # A reference configuration that is missing or half measured is missing evidence; only an
+        # error found on it is a demonstrated failure.
+        demonstrated = reference is not None and reference["status"] in ("ERROR", "SKIPPED", "UNSUPPORTED")
         out.append(("the qualified reference configuration is clean in the three directions",
-                    reference is not None and reference["status"] == "CLEAN", "check",
+                    reference is not None and reference["status"] == "CLEAN",
+                    "check" if demonstrated else "require",
                     reference and {"status": reference["status"], "errors": reference["errors"][:2]}))
-        out.append(("a best configuration exists", report["best"] is not None, "check", report["best"]))
+        out.append(("a best configuration exists", report["best"] is not None,
+                    "check" if demonstrated else "require", report["best"]))
     lines_bound = 40 + n * (3 * (1 + max(m, 1)) + 4)
     out.append(("no per-packet logging", report["p4_bench_lines"] <= lines_bound, "check",
                 (report["p4_bench_lines"], lines_bound)))

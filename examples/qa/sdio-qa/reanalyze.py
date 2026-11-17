@@ -7,7 +7,15 @@ folder. It records which firmware actually ran (the run's source SHA), which eva
 logs (commit and file digests), the SHA-256 of every raw input, the original verdict and the new
 one. It refuses to overwrite an existing reanalysis and never touches a board or a server.
 
-    python reanalyze.py --p4 EVIDENCE_P4 --c6 EVIDENCE_C6 --scenario bench-smoke
+    python reanalyze.py --p4 EVIDENCE_P4 --c6 EVIDENCE_C6 --scenario bench-smoke [--p4-session N]
+
+A capture can hold several boots of the P4 (a restart, a second plan after the first): the live
+evaluation then refuses to judge it (INDETERMINATE). Here ONE session is chosen explicitly with
+`--p4-session` (1-based; required when there are several) and judged with the C6 sessions that
+belong to it: the P4 resets the C6 once per configuration it attempts, so they are counted from the
+earlier sessions. When that count cannot be trusted (an earlier session is truncated, or the C6
+sessions are missing) the association is ambiguous and the record says INDETERMINATE without
+evaluating anything. The whole capture, the other sessions and the original verdict are kept.
 """
 import argparse
 import hashlib
@@ -42,7 +50,18 @@ def evaluator_identity():
             "files": {name: sha256(HERE / name) for name in EVALUATOR_FILES}}
 
 
-def reanalyze(p4_dir, c6_dir, scenario, *, identity=None, now=None):
+def _bench_module():
+    spec = importlib.util.spec_from_file_location("sdio_qa_reanalysis_bench", HERE / "bench_verdict.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class SessionRequired(ValueError):
+    """The capture holds several P4 sessions and none was chosen."""
+
+
+def reanalyze(p4_dir, c6_dir, scenario, *, p4_session=None, identity=None, now=None):
     """Returns the reanalysis record (nothing is written)."""
     p4_dir, c6_dir = Path(p4_dir), Path(c6_dir)
     inputs = {}
@@ -57,8 +76,23 @@ def reanalyze(p4_dir, c6_dir, scenario, *, identity=None, now=None):
                        "complete_observation": data.get("complete_observation"), "error": data.get("error")}
         lines += [module.Line(b, t, body) for b, t, body in data["lines"]]
     original = json.loads((p4_dir / f"verdict-{scenario}.json").read_text())
-    parameters = p4_dir.parent / "parameters.json"
-    result = module.evaluate(scenario, lines)[scenario]
+    bench = _bench_module() if scenario.startswith("bench-") else None
+    sessions = bench.p4_sessions(lines) if bench else []
+    association, ambiguity = None, None
+    if bench and (p4_session is not None or len(sessions) > 1):
+        if p4_session is None:
+            raise SessionRequired(f"the capture holds {len(sessions)} P4 sessions: choose one with --p4-session")
+        try:
+            lines, association = bench.select_session(lines, p4_session)
+        except bench.AmbiguousAssociation as error:
+            ambiguity = str(error)
+    if ambiguity:
+        status, checks, report = "INDETERMINATE", [{"check": "the C6 sessions of the P4 session are determined",
+                                                    "ok": False, "detail": ambiguity}], None
+        result = None
+    else:
+        result = module.evaluate(scenario, lines)[scenario]
+        status, checks, report = result.status, result.checks, result.report
     identity = identity or evaluator_identity()
     return {
         "kind": "reanalysis",
@@ -73,9 +107,17 @@ def reanalyze(p4_dir, c6_dir, scenario, *, identity=None, now=None):
                              "sha256": sha256(p4_dir / f"verdict-{scenario}.json"),
                              "status": original["status"],
                              "failed_checks": [c["check"] for c in original["checks"] if not c["ok"]]},
-        "reanalysed_verdict": {"status": result.status, "checks": result.checks,
-                               "failed_checks": [c["check"] for c in result.checks if not c["ok"]],
-                               "report": result.report},
+        "p4_sessions_in_capture": len(sessions),
+        "selected_p4_session": p4_session,
+        "session_association": association,
+        "association_ambiguity": ambiguity,
+        "limits": ["Session boundaries are the boot banners of the saved capture; the raw log is kept whole.",
+                   "The C6 sessions of a P4 session are counted from the earlier sessions (one reset per "
+                   "attempted configuration, confirmation included), not read from a link in the logs.",
+                   "Only the selected session is judged; the others are listed, not evaluated."],
+        "reanalysed_verdict": {"status": status, "checks": checks,
+                               "failed_checks": [c["check"] for c in checks if not c["ok"]],
+                               "report": report},
     }
 
 
@@ -115,7 +157,8 @@ def _find(value, key):
 def write_new(p4_dir, record):
     """Writes the record to a new file; an existing reanalysis is never replaced."""
     tag = (record["evaluator"]["commit"] or "unknown")[:12]
-    target = Path(p4_dir) / f"reanalysis-{record['scenario']}-{tag}.json"
+    session = f"-p4s{record['selected_p4_session']}" if record.get("selected_p4_session") else ""
+    target = Path(p4_dir) / f"reanalysis-{record['scenario']}-{tag}{session}.json"
     with open(target, "x") as stream:  # 'x': fails if it exists
         json.dump(record, stream, indent=2, sort_keys=True, default=str)
         stream.write("\n")
@@ -127,8 +170,13 @@ def main():
     parser.add_argument("--p4", required=True, type=Path)
     parser.add_argument("--c6", required=True, type=Path)
     parser.add_argument("--scenario", required=True)
+    parser.add_argument("--p4-session", type=int, default=None,
+                        help="1-based P4 session to judge (required when the capture holds several)")
     args = parser.parse_args()
-    record = reanalyze(args.p4, args.c6, args.scenario)
+    try:
+        record = reanalyze(args.p4, args.c6, args.scenario, p4_session=args.p4_session)
+    except SessionRequired as error:
+        raise SystemExit(str(error))
     print(write_new(args.p4, record))
     print("original:", record["original_verdict"]["status"], "| reanalysed:",
           record["reanalysed_verdict"]["status"])

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import traceback
 from pathlib import Path
 
 import pytest
@@ -464,7 +465,7 @@ def test_a_failed_renewal_stops_the_observation_and_keeps_the_evidence(world, mo
         original = board.renew
 
         def broken(ttl):
-            if any(c[0] == "gesture" and "boots the scenario" in c[1] for c in world["calls"]):  # observing
+            if any(f.name == "_observe" for f in traceback.extract_stack()):  # during the observation only
                 raise RuntimeError("lease expired")
             return original(ttl)
         return broken
@@ -509,10 +510,11 @@ def test_a_benchmark_drains_the_c6_pages_that_arrived_after_the_p4_finished(worl
     WORLD.clear()
     WORLD.update(world)
     world["params"]["scenario_timeouts"] = {"bench-smoke": 100}
+    PagedConsole.armed = True
     outcome = flow.run(world["params"], world["consent"], ["bench-smoke"], world["regions"], world["build"],
                        world["tmp"], world["campaigns"], world["orchestrators"], world["boards"], PagedConsole,
                        lambda label: (world["calls"].append(("gesture", label)),
-                                      setattr(PagedConsole, "armed", "boots the scenario" in label)),
+                                      None),
                        sleep=lambda s: None, clock=iter(range(0, 100000, 1)).__next__)
     PagedConsole.armed = False
     assert outcome.error is None
@@ -556,3 +558,29 @@ def test_no_revoke_request_without_an_active_grant(world):
         world["campaigns"][key].client = Quiet()
     go(world, ["bench-smoke"])
     assert not any(c[0] == "gesture" and "revoke the local grant" in c[1] for c in world["calls"])
+
+
+BOOTED = ["QA|P4|t=1|boot|firmware=sdio-bench-host|plan=smoke\n",
+          "QA|P4|t=2|RESULT|bench|P4_DONE|plan=smoke|measured_clean=1\n"]
+
+
+def reset_gestures(world):
+    return [c[1] for c in world["calls"] if c[0] == "gesture" and "boots the scenario" in c[1]
+            and "bench-smoke" in c[1]]
+
+
+def test_a_benchmark_never_asks_for_a_reset_when_the_p4_boots_by_itself(world):
+    go(world, ["bench-smoke"], script={"p4": BOOTED})
+    assert reset_gestures(world) == []
+
+
+def test_a_benchmark_asks_once_for_a_reset_if_the_p4_never_boots(world):
+    world["params"]["scenario_timeouts"] = {"bench-smoke": 200}
+    go(world, ["bench-smoke"], script={})
+    asked = reset_gestures(world)
+    assert len(asked) == 1 and "did not boot by itself" in asked[0]
+
+
+def test_the_other_scenarios_still_ask_for_the_reset(world):
+    go(world, ["h1"])
+    assert any("boots the scenario" in c[1] for c in world["calls"] if c[0] == "gesture")

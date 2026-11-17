@@ -44,7 +44,8 @@ def c6_phase(phase, mode, size, count, errors=0):
 def make(configs, confirm=True, c6_content_errors=0, drop_c6_phase=None, measurements=3, confirm_us=30_500_000,
          confirm_clean=True, extra_p4=0, confirm_c6_errors=0, confirm_cfg=None, plan="test"):
     """P4 and C6 lines for the configurations, each `kind` being clean, error, skip or unsupported."""
-    p4 = [L("P4", f"bench_plan|name={plan}|configurations={len(configs)}|module_hz=80000000|measurements={measurements}|"
+    p4 = [L("P4", f"boot|firmware=sdio-bench-host|plan={plan}"),
+          L("P4", f"bench_plan|name={plan}|configurations={len(configs)}|module_hz=80000000|measurements={measurements}|"
                   f"window_ms=5000|confirm_ms={30000 if confirm else 0}|warmup_packets=8")]
     c6, phase, best = [], 0, None
     for cfg in configs:

@@ -121,14 +121,36 @@ partial evidence and runs the cleanup. At the end, once the boards are restored,
 operator to revoke the local grants and waits up to 5 minutes for them to disappear (`Campaign.close()`
 refuses an active grant); it never revokes a grant itself and reports one that stays active.
 
+## The P4 boots by itself, one session per capture
+
+The P4 boots on its own when its programming ends, and a plan takes minutes. A `bench-*` scenario
+therefore does **not** ask the operator to reset the P4: a reset would start a second plan on top
+of the first. Only if no boot banner of the P4 appears within 60 s does the recipe ask, once, for
+a reset (the other scenarios keep their usual request).
+
+If a capture nevertheless holds several boots of the P4 (a restart, a second plan), the live
+evaluation does not merge them: it reports INDETERMINATE (`the capture holds a single P4 session`).
+
 ## Re-reading captures without flashing again
 
-A change of the evaluator does not need a new hardware run. `reanalyze.py --p4 <evidence p4>
---c6 <evidence c6> --scenario bench-smoke` re-evaluates the saved captures and adds
-`reanalysis-<scenario>-<evaluator commit>.json` to the P4 evidence: firmware source SHA that ran,
-evaluator commit and file digests, SHA-256 of every raw input, the original verdict and the new
-one. The original verdict is kept untouched and an existing reanalysis is never overwritten. It does
-not make the run a pass of the revision that produced it.
+A change of the evaluator, or a capture with several P4 sessions, does not need a new hardware
+run. `reanalyze.py --p4 <evidence p4> --c6 <evidence c6> --scenario bench-qualified
+[--p4-session N]` re-evaluates the saved captures and adds
+`reanalysis-<scenario>-<evaluator commit>[-p4sN].json` to the P4 evidence: firmware source SHA that
+ran, evaluator commit and file digests, SHA-256 of every raw input, the original verdict, the
+sessions of the capture, the session judged and its C6 sessions, and the new verdict. The original
+verdict and capture are kept whole and an existing reanalysis is never overwritten. It does not
+make the run a pass of the revision that produced it.
+
+- **One session is chosen explicitly** (`--p4-session`, 1-based, required when there are several)
+  and judged alone; the other sessions are listed with their completeness, not evaluated.
+- **Its C6 sessions are counted, not read from a link in the logs:** the P4 resets the C6 once for
+  every configuration it attempts (the confirmation included) and prints `bench_config` after each
+  reset, so they are the next C6 sessions after those of the earlier P4 sessions.
+- **Ambiguity is INDETERMINATE, with nothing evaluated:** an earlier P4 session that is truncated
+  or without banner (its resets cannot be counted), a missing C6 session, an unknown session number.
+  A foreign C6 reset ahead of the plan shifts the association: the phase cross-checks then fail to
+  match, so it never gives a PASS, but this is a limit of counting rather than a proof.
 
 ## Limits to keep in mind
 

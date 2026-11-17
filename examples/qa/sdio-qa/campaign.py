@@ -181,6 +181,7 @@ def _c6_into_download(state, boards, orchestrators, make_console, gesture, sleep
     return _c6ctl("C6 RESET", state, boards, orchestrators, make_console, sleep, clock)
 
 
+START_WAIT_S = 60  # a benchmark waits this long for the P4 to boot by itself before asking for a reset
 SETTLE_S = 3  # a benchmark keeps reading this long after the P4 reports the end (the C6 times out at 30 s)
 DRAIN_LIMIT = 200  # pages of UART events read in one pass
 
@@ -211,11 +212,21 @@ def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, 
         # and the C6 boot banner is lost if its own port is not open by then.
         for key in ("c6", "p4"):
             boards[key].console()
-        gesture(f"{scenario}: reset the P4 so that it boots the scenario (it resets the C6 itself)")
-        deadline = clock() + params.get("scenario_timeouts", {}).get(
+        bench = scenario.startswith("bench-")
+        if not bench:
+            gesture(f"{scenario}: reset the P4 so that it boots the scenario (it resets the C6 itself)")
+        # A benchmark takes minutes and the P4 boots by itself when its programming ends: a reset
+        # asked for here would start a second plan on top of the first. It is only requested, once,
+        # if no boot banner of the P4 appears.
+        started, asked = clock(), False
+        deadline = started + params.get("scenario_timeouts", {}).get(
             scenario, params.get("scenario_timeout_seconds", 90))
-        renewed = clock()
+        renewed = started
         while clock() < deadline:
+            if bench and not asked and clock() - started >= START_WAIT_S and not any(
+                    x.board == "P4" and x.kind == "boot" for x in consoles["p4"].assembler.lines):
+                asked = True
+                gesture(f"{scenario}: the P4 did not boot by itself: reset it so that it boots the scenario")
             if clock() - renewed >= RENEW_EVERY:
                 # A long benchmark outlives the reservation TTL. A failed renewal raises: the
                 # partial captures are saved as evidence and the cleanup runs, nothing continues.

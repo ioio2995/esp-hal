@@ -331,8 +331,18 @@ def _bench_module():
 
 def _bench(scenario, lines):
     module = _bench_module()
-    report = module.analyze(lines)
     v = Verdict()
+    sessions = module.p4_sessions(lines)
+    if len(sessions) > 1:
+        # Two boots of the P4 in one capture (a restart, a second run): their lines would be
+        # merged into one configuration table. Never judged as one run: see reanalyze.py to read
+        # one session with its own C6 sessions.
+        v.require("the capture holds a single P4 session", False,
+                  {"p4_sessions": [{"complete": s["complete"], "configurations": s["configurations"],
+                                    "lines": len(s["lines"])} for s in sessions]})
+        v.report = {"p4_sessions": len(sessions), "markdown": "Several P4 sessions in one capture: not evaluated."}
+        return v
+    report = module.analyze(lines)
     for name, ok, kind, detail in module.checks(report):
         (v.check if kind == "check" else v.require)(name, ok, detail)
     shown = {k: val for k, val in report.items() if k not in ("c6_session_lines", "c6_phases")}
