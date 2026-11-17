@@ -181,6 +181,20 @@ def _c6_into_download(state, boards, orchestrators, make_console, gesture, sleep
     return _c6ctl("C6 RESET", state, boards, orchestrators, make_console, sleep, clock)
 
 
+SETTLE_S = 3  # a benchmark keeps reading this long after the P4 reports the end (the C6 times out at 30 s)
+DRAIN_LIMIT = 200  # pages of UART events read in one pass
+
+
+def _drain(console):
+    """Reads the console until a poll brings nothing new: one poll reads one bounded page, and the
+    text that accumulated while the campaign waited for the operator must not be left behind."""
+    for _ in range(DRAIN_LIMIT):
+        before = len(console.raw)
+        console.poll()
+        if len(console.raw) == before:
+            return
+
+
 RENEW_EVERY = 300  # seconds between two renewals of the reservations during an observation
 
 
@@ -209,9 +223,17 @@ def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, 
                     boards[key].renew(ttl=ttl)
                 renewed = clock()
             for console in consoles.values():
-                console.poll()
+                (_drain if scenario.startswith("bench-") else type(console).poll)(console)
             lines = consoles["p4"].assembler.lines + consoles["c6"].assembler.lines
             if verdict.run_complete(scenario, lines):
+                if scenario.startswith("bench-"):
+                    # The P4 is done, the C6 phase summaries may still be on their way: keep
+                    # draining for a short, bounded time before the evidence is judged.
+                    settled = clock() + SETTLE_S
+                    while clock() < settled:
+                        sleep(0.2)
+                        for console in consoles.values():
+                            _drain(console)
                 break
             sleep(0.2)
     except BaseException as caught:  # noqa: BLE001 - evidence is saved, then the error continues

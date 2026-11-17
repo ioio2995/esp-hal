@@ -473,3 +473,48 @@ def test_a_failed_renewal_stops_the_observation_and_keeps_the_evidence(world, mo
     outcome = go(world, ["bench-smoke"])
     assert outcome.error is not None or outcome.verdicts == {}
     assert (world["campaigns"]["p4"].directory / "uart-bench-smoke-lines.json").exists()
+
+
+class PagedConsole:
+    """Delivers one line per poll, like a bounded page of events, after the P4 already finished."""
+    pages = {}
+
+    def __init__(self, board):
+        self.board = board
+        self.assembler = verdict.LineAssembler()
+        self.raw = bytearray()
+        self.queue = list(self.pages.get(board.key, []))
+
+    def start(self):
+        pass
+
+    armed = False
+
+    def poll(self):
+        if self.board.key == "p4":
+            pending, WORLD["pending"][:] = list(WORLD["pending"]), []
+            for text in pending:  # the control acknowledgements, as in the other fakes
+                self.assembler.feed(text.encode())
+        if self.armed and self.queue:
+            text = self.queue.pop(0)
+            self.raw += text.encode()
+            self.assembler.feed(text.encode())
+
+
+def test_a_benchmark_drains_the_c6_pages_that_arrived_after_the_p4_finished(world):
+    c6 = ["QA|C6|t=1|boot|firmware=sdio-bench-slave|plan=smoke\n"] + [
+        f"QA|C6|t={i}|bench_phase|id={i}|mode=p4_to_c6|length=64|count=8|packets_ok=8|bytes_ok=512|"
+        "content_errors=0|first_error_byte=-1|first_error_seq=-1\n" for i in range(2, 9)]
+    PagedConsole.pages = {"p4": ["QA|P4|t=1|RESULT|bench|P4_DONE|plan=smoke|measured_clean=1\n"], "c6": c6}
+    WORLD.clear()
+    WORLD.update(world)
+    world["params"]["scenario_timeouts"] = {"bench-smoke": 100}
+    outcome = flow.run(world["params"], world["consent"], ["bench-smoke"], world["regions"], world["build"],
+                       world["tmp"], world["campaigns"], world["orchestrators"], world["boards"], PagedConsole,
+                       lambda label: (world["calls"].append(("gesture", label)),
+                                      setattr(PagedConsole, "armed", "boots the scenario" in label)),
+                       sleep=lambda s: None, clock=iter(range(0, 100000, 1)).__next__)
+    PagedConsole.armed = False
+    assert outcome.error is None
+    saved = json.loads((world["campaigns"]["c6"].directory / "uart-bench-smoke-lines.json").read_text())
+    assert len([x for x in saved["lines"] if "bench_phase" in x[2]]) == 7  # nothing left behind
