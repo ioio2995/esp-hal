@@ -63,7 +63,7 @@ def h2():
 
 TAIL_OK = ("tail_check|odd_response|length=65|rounded=68|nonff_in_rounding=3|nonff_beyond=0|"
            "first_beyond=None|last_beyond=None|head_guard_ok=true|tail_guard_ok=true|"
-           "writeback_before_dma=true|after_length=[c8, cb, ce, ff]")
+           "writeback_before_dma=true|invalidated_after_dma=256|after_length=[c8, cb, ce, ff]")
 
 
 def h3():
@@ -249,3 +249,8 @@ def test_h3_missing_tail_report_is_indeterminate():
 
 def test_h3_bytes_inside_the_word_rounding_are_only_an_observation():
     assert _h3_with_tail(TAIL_OK) == "PASS"
+
+
+def test_h3_without_the_full_invalidation_does_not_pass():
+    assert _h3_with_tail(TAIL_OK.replace("invalidated_after_dma=256", "invalidated_after_dma=65")) == "FAIL"
+    assert _h3_with_tail(TAIL_OK.replace("invalidated_after_dma=256", "invalidated_after_dma=0")) == "FAIL"

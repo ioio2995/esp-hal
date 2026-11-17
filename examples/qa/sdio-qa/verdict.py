@@ -193,6 +193,8 @@ def _h3(lines):
         f = tail[0].fields()
         v.check("cache write-back preceded the DMA", f.get("writeback_before_dma") == "true",
                 f.get("writeback_before_dma"))
+        v.check("the whole buffer (256 bytes) was invalidated after the DMA",
+                f.get("invalidated_after_dma") == "256", f.get("invalidated_after_dma"))
         v.check("nothing written beyond the 68-byte descriptor size",
                 f.get("nonff_beyond") == "0",
                 {k: f.get(k) for k in ("nonff_beyond", "first_beyond", "last_beyond")})

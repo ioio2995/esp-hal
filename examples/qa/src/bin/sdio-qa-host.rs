@@ -138,7 +138,7 @@ impl Guarded {
 /// that size. The data area was written back to memory before the DMA, so any such byte was
 /// written by the transfer, not brought back by a stale cache line. Returns whether the area
 /// outside the descriptor size and both guards are untouched.
-fn tail_report(label: &str, buffer: &Guarded, length: usize) -> bool {
+fn tail_report(label: &str, buffer: &Guarded, length: usize, invalidated: usize) -> bool {
     let rounded = (length + 3) & !3;
     let in_rounding = buffer.data[length..rounded]
         .iter()
@@ -151,7 +151,7 @@ fn tail_report(label: &str, buffer: &Guarded, length: usize) -> bool {
     let head_ok = buffer.head.iter().all(|byte| *byte == GUARD);
     let tail_ok = buffer.tail.iter().all(|byte| *byte == GUARD);
     qa!(
-        "tail_check|{}|length={}|rounded={}|nonff_in_rounding={}|nonff_beyond={}|first_beyond={:?}|last_beyond={:?}|head_guard_ok={}|tail_guard_ok={}|writeback_before_dma={}|after_length={:02x?}",
+        "tail_check|{}|length={}|rounded={}|nonff_in_rounding={}|nonff_beyond={}|first_beyond={:?}|last_beyond={:?}|head_guard_ok={}|tail_guard_ok={}|writeback_before_dma={}|invalidated_after_dma={}|after_length={:02x?}",
         label,
         length,
         rounded,
@@ -162,6 +162,7 @@ fn tail_report(label: &str, buffer: &Guarded, length: usize) -> bool {
         head_ok,
         tail_ok,
         cfg!(soc_internal_memory_cached),
+        invalidated,
         &buffer.data[length..(length + 8).min(128)]
     );
     if let Some(first) = first {
@@ -613,6 +614,17 @@ fn read_response(
             qa!("cmd_error|CMD53 read|{:?}", error);
             "CMD53 read failed"
         })?;
+    // The driver invalidates only the cache lines of the 65-byte view. Invalidate the whole
+    // structure (data area and both guards) before any inspection, and never write back after the
+    // DMA: that would overwrite what the transfer wrote with an older cached copy.
+    #[cfg(soc_internal_memory_cached)]
+    let invalidated = {
+        let whole = DmaAlignedMut::new(&mut buffer).map_err(|_| "unaligned guarded buffer")?;
+        whole.invalidate();
+        core::mem::size_of::<Guarded>()
+    };
+    #[cfg(not(soc_internal_memory_cached))]
+    let invalidated = 0usize;
     check_r5("cmd53_read", response)?;
     let expected_bytes: [u8; 65] = core::array::from_fn(expected);
     let mismatch = first_mismatch(&buffer.data[..length], &expected_bytes[..length]);
@@ -626,7 +638,7 @@ fn read_response(
     if mismatch.is_some() {
         return fail("response payload mismatch", mismatch);
     }
-    if !tail_report(label, &buffer, length) {
+    if !tail_report(label, &buffer, length, invalidated) {
         return fail("the transfer altered bytes outside its descriptor size or a guard", ());
     }
     accounting.bytes = length_add(accounting.bytes, length as u32);
