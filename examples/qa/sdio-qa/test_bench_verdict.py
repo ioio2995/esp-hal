@@ -273,3 +273,22 @@ def test_smoke_with_a_crc_error_on_the_reference_fails():
 
 def test_exploratory_error_after_a_clean_reference_does_not_fail_the_run():
     assert evaluate(make(cfgs("clean", "error"), plan="qualified")).status == "PASS"
+
+
+def test_confirmation_at_another_frequency_in_all_directions_fails():
+    lines = make(cfgs("clean", "clean"))
+    lines = [verdict.Line(x.board, 1, x.body.replace("requested_hz=400000", "requested_hz=5000000")
+                          .replace("actual_hz=400000", "actual_hz=5000000"))
+             if x.kind in ("bench_confirm", "bench_config", "bench_best") and x.body.count("size=256") else x
+             for x in lines]
+    # the initial measurements stay at 400 kHz; only the confirmation block was changed
+    result = evaluate(lines)
+    assert result.status == "FAIL"
+    assert result.report["configs"]["1"]["requested_hz"] == 400_000
+
+
+def test_confirmation_with_another_effective_frequency_or_width_fails():
+    for old, new in (("actual_hz=400000", "actual_hz=500000"), ("width=1", "width=4")):
+        lines = [verdict.Line(x.board, 1, x.body.replace(old, new)) if x.kind == "bench_confirm" else x
+                 for x in make(cfgs("clean", "clean"))]
+        assert evaluate(lines).status == "FAIL", old

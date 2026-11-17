@@ -99,12 +99,17 @@ def analyze(lines):
         if x.board != "P4":
             continue
         f = x.fields()
+        if in_confirm and x.kind in ("bench_config", "bench_error"):
+            f_entry = {k: v for k, v in f.items() if k not in ("requested_hz", "actual_hz", "width", "size")}
+        else:
+            f_entry = f
         if x.kind == "bench_best":
             in_confirm = True
         elif x.kind == "bench_config":
-            e = entry(_int(f.get("cfg")), f)
-            e["cmd53"] = f.get("cmd53", "")
-            order.append(e["id"])
+            e = entry(_int(f.get("cfg")), f_entry)
+            if not in_confirm:
+                e["cmd53"] = f.get("cmd53", "")
+                order.append(e["id"])
         elif x.kind == "bench_warmup":
             if not in_confirm:
                 entry(_int(f.get("cfg")), f)["modes"][f.get("mode")]["warmup"] = _measurement(f)
@@ -113,10 +118,12 @@ def analyze(lines):
             e["modes"][f.get("mode")]["windows"].append(_measurement(f))
         elif x.kind == "bench_confirm":
             record = _measurement(f)
-            record["params"] = (_int(f.get("requested_hz")), _int(f.get("width")), _int(f.get("size")))
-            entry(_int(f.get("cfg")), f).setdefault("confirm", {})[f.get("mode")] = record
+            # The confirmation's own parameters are kept apart: they never replace the initial ones.
+            record["params"] = (_int(f.get("requested_hz")), _int(f.get("actual_hz")),
+                                _int(f.get("width")), _int(f.get("size")))
+            entry(_int(f.get("cfg"))).setdefault("confirm", {})[f.get("mode")] = record
         elif x.kind == "bench_error":
-            e = entry(_int(f.get("cfg")), f)
+            e = entry(_int(f.get("cfg")), f_entry)
             reason = re.search(r"reason=([^|]*)", x.body)
             record = {
                 "mode": f.get("mode"), "window": _int(f.get("window")),
@@ -264,7 +271,7 @@ def checks(report):
         out.append(("the best configuration was confirmed", c is not None, "require", ""))
         if c:
             best = configs[report["best"]]
-            wanted = (best["requested_hz"], best["width"], best["size"])
+            wanted = (best["requested_hz"], best["actual_hz"], best["width"], best["size"])
             confirmed = {mode: c["modes"].get(mode, {}).get("params") for mode in MODES}
             out.append(("the confirmed configuration is the best one, announced and computed, with the same parameters",
                         c["cfg"] == report["best"] == report["announced_best"]
