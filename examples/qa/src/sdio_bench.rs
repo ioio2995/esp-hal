@@ -31,6 +31,10 @@ pub enum Plan {
     W4,
     /// `Qualified`, `W1` and `W4` in this order.
     Full,
+    /// Validation of the high speed configuration of the C6 slave: the qualified frequency as the
+    /// low-frequency reference, 20 MHz (below the 25 MHz limit, so without EHS) and 40 MHz (above
+    /// it: SHS advertised and EHS negotiated), each with 64 and 4096-byte packets.
+    Hs,
 }
 
 impl Plan {
@@ -47,6 +51,8 @@ impl Plan {
             Some(Self::W4)
         } else if eq(name, b"full") {
             Some(Self::Full)
+        } else if eq(name, b"hs") {
+            Some(Self::Hs)
         } else {
             None
         }
@@ -146,8 +152,19 @@ pub const fn config_count(plan: Plan) -> usize {
         Plan::Full => {
             SIZES.len() + (REQUESTED_HZ.len() - 1) * SIZES.len() + REQUESTED_HZ.len() * SIZES.len()
         }
+        Plan::Hs => HS_CONFIGS.len(),
     }
 }
+
+/// The configurations of [`Plan::Hs`] as `(requested frequency, packet size)`, 1-bit bus, in
+/// ascending frequency order for each size.
+pub const HS_CONFIGS: [(u32, u32); 5] = [
+    (400_000, 64),
+    (20_000_000, 64),
+    (40_000_000, 64),
+    (20_000_000, 4096),
+    (40_000_000, 4096),
+];
 
 /// The `n`-th configuration of a plan, in execution order: ascending frequency, then ascending
 /// size, so that the ladder rule can skip what a failed lower frequency already excludes.
@@ -161,6 +178,11 @@ pub const fn config(plan: Plan, n: usize) -> Option<Config> {
             requested_hz: REQUESTED_HZ[0],
             width: Width::One,
             size: SIZES[0],
+        },
+        Plan::Hs => Config {
+            requested_hz: HS_CONFIGS[n].0,
+            width: Width::One,
+            size: HS_CONFIGS[n].1,
         },
         Plan::Qualified => Config {
             requested_hz: REQUESTED_HZ[0],
@@ -499,7 +521,7 @@ mod tests {
 
     #[test]
     fn plans_enumerate_every_configuration_once_in_order() {
-        for plan in [Plan::Smoke, Plan::Qualified, Plan::W1, Plan::W4, Plan::Full] {
+        for plan in [Plan::Smoke, Plan::Qualified, Plan::W1, Plan::W4, Plan::Full, Plan::Hs] {
             let count = config_count(plan);
             assert!(config(plan, count).is_none());
             let all: Vec<_> = (0..count).map(|n| config(plan, n).unwrap()).collect();
@@ -510,7 +532,8 @@ mod tests {
                 if pair[0].width == pair[1].width {
                     assert!(
                         (pair[0].requested_hz, pair[0].size) < (pair[1].requested_hz, pair[1].size)
-                            || plan == Plan::Full,
+                            || plan == Plan::Full
+                            || plan == Plan::Hs,
                         "{plan:?} is not ascending"
                     );
                 }
@@ -523,6 +546,25 @@ mod tests {
         assert_eq!(w1_first.requested_hz, 5_000_000);
         let w4_first = config(Plan::W4, 0).unwrap();
         assert_eq!((w4_first.requested_hz, w4_first.width), (400_000, Width::Four));
+    }
+
+    #[test]
+    fn the_hs_plan_compares_low_frequency_20_mhz_and_40_mhz() {
+        assert_eq!(Plan::parse("hs"), Some(Plan::Hs));
+        assert_eq!(Plan::Hs.timing(), (3, 5_000, 30_000));
+        let all: Vec<_> = (0..config_count(Plan::Hs)).map(|n| config(Plan::Hs, n).unwrap()).collect();
+        // the first configuration is the qualified reference, 1-bit bus throughout
+        assert_eq!((all[0].requested_hz, all[0].size), (400_000, 64));
+        assert!(all.iter().all(|c| c.width == Width::One));
+        // 20 MHz stays below the 25 MHz limit (no EHS), 40 MHz is above it (SHS and EHS needed)
+        assert!(all.iter().any(|c| card_clock_hz(c.requested_hz) == 20_000_000));
+        assert!(all.iter().any(|c| card_clock_hz(c.requested_hz) == 40_000_000));
+        assert!(all.iter().all(|c| card_clock_hz(c.requested_hz) == c.requested_hz), "every frequency is exact");
+        // for each packet size the frequencies ascend, so that the ladder rule can skip higher ones
+        for size in [64, 4096] {
+            let hz: Vec<_> = all.iter().filter(|c| c.size == size).map(|c| c.requested_hz).collect();
+            assert!(hz.windows(2).all(|p| p[0] < p[1]), "size {size} is not ascending: {hz:?}");
+        }
     }
 
     #[test]

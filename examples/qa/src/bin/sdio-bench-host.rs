@@ -580,10 +580,20 @@ fn configure(host: &mut Host<'_>, cfg: BenchConfig) -> Result<(), ConfigError> {
     if actual > 25_000_000 {
         let speed = register(host, 0, 0x13, None)?;
         if speed & 1 == 0 {
+            qa!("bench_hs|requested_hz={}|size={}|cccr13_before={:#04x}|result=not_advertised", cfg.requested_hz, cfg.size, speed);
             return Err(ConfigError::Unsupported("card does not advertise high speed"));
         }
         register(host, 0, 0x13, Some(speed | 0x02))?;
-        if register(host, 0, 0x13, None)? & 0x02 == 0 {
+        let after = register(host, 0, 0x13, None)?;
+        qa!(
+            "bench_hs|requested_hz={}|size={}|cccr13_before={:#04x}|cccr13_after={:#04x}|result={}",
+            cfg.requested_hz,
+            cfg.size,
+            speed,
+            after,
+            if after & 0x02 == 0 { "not_accepted" } else { "accepted" }
+        );
+        if after & 0x02 == 0 {
             return Err(ConfigError::Unsupported("high speed not accepted"));
         }
     }

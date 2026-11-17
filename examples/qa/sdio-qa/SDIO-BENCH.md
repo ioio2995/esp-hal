@@ -124,6 +124,26 @@ partial evidence and runs the cleanup. At the end, once the boards are restored,
 operator to revoke the local grants and waits up to 5 minutes for them to disappear (`Campaign.close()`
 refuses an active grant); it never revokes a grant itself and reports one that stays active.
 
+## Plan `hs`: validation of the high speed configuration of the C6
+
+The 40 MHz configurations of `w1` were excluded because the C6 slave did not advertise high speed
+(`HINF_CFG_DATA1.HIGHSPEED_ENABLE` stayed at its reset value 0). The driver change that sets it,
+with `SLCHOST_CONF.HSPEED_CON_EN` (the sending edge follows the EHS mode the host selects), lives on
+its own branch and is validated with this plan, built against that driver. It runs five
+configurations on a 1-bit bus: 400 kHz / 64 bytes (the qualified reference, which must be clean,
+exactly as in `smoke`), 20 MHz (below the 25 MHz limit, so without EHS) and 40 MHz (above it, SHS
+advertised and EHS negotiated), each with 64 and 4096-byte packets.
+
+What is logged, outside every timed window: the C6 prints `bench_regs|when=exposed|...` right after it
+exposes the bus (`HINF_CFG_DATA1`, `SLCHOST_CONF`, SHS and EHS decoded) and the same four values on
+every `bench_phase` line; the P4 prints `bench_hs|...` with CCCR `0x13` before and after it writes
+EHS, and the existing `bench_caps` line with the CCCR read at the qualified setting. The report lists
+them under "High speed configuration". The verdict **fails** if the C6 does not report SHS once the bus is
+exposed or the P4 reads no SHS bit in the CCCR (the driver change did not take effect), and is
+INDETERMINATE if either is missing. An error at 40 MHz is a result of the benchmark, not a failure of
+the plan: the configuration is classified and never retained as a reliable maximum. Nothing here tunes
+the sampling phase or the edge force bits.
+
 ## The P4 boots by itself, one session per capture
 
 The P4 boots on its own when its programming ends, and a plan takes minutes. A `bench-*` scenario

@@ -12,12 +12,12 @@ import importlib.util
 import json
 from pathlib import Path
 
-BENCH_PLANS = ("smoke", "qualified", "w1", "w4", "full")
+BENCH_PLANS = ("smoke", "qualified", "w1", "w4", "full", "hs")
 BENCH_SCENARIOS = tuple("bench-" + plan for plan in BENCH_PLANS)
 # Minimum observation time (seconds) a benchmark plan needs: 1.5 x the estimate of its duration
 # (about 50 s per configuration, 100 s of confirmation).
 BENCH_TIMEOUT_S = {"bench-smoke": 90, "bench-qualified": 600, "bench-w1": 1500, "bench-w4": 1800,
-                   "bench-full": 3300}
+                   "bench-full": 3300, "bench-hs": 600}
 SCENARIOS = ("h1", "h2", "h3", "h4", "h567") + BENCH_SCENARIOS
 CONTROL_SCENARIO = "c6ctl"  # P4 image that controls the C6 EN line; always required
 C6CTL_GRANT = 60  # seconds of local grant for a `uart.write` to the control firmware

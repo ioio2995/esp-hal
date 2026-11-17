@@ -18,9 +18,9 @@ def _lines(lines, board, kind):
     return [x for x in lines if x.board == board and x.kind == kind]
 
 
-def _int(value, default=0):
+def _int(value, default=0, base=10):
     try:
-        return int(value)
+        return int(value, base) if isinstance(value, str) else int(value)
     except (TypeError, ValueError):
         return default
 
@@ -259,6 +259,17 @@ def analyze(lines):
             if x.kind == "bench_phase":
                 c6_phases[_int(x.fields().get("id"))] = x.fields()
 
+    # High speed configuration findings: what the C6 reports (registers at exposure and after each
+    # phase) and what the P4 sees (CCCR) before and after the EHS negotiation.
+    hs = {
+        "c6_exposed": [x.fields() for session in sessions for x in session if x.kind == "bench_regs"],
+        "c6_phases": {i: {k: f.get(k) for k in ("shs", "ehs", "hinf_cfg_data1", "slchost_conf")}
+                      for i, f in c6_phases.items() if "shs" in f},
+        "p4_cccr_speed": [x.fields().get("bus_speed")
+                          for x in _lines(lines, "P4", "bench_caps") if "bus_speed" in x.fields()],
+        "negotiations": [x.fields() for x in _lines(lines, "P4", "bench_hs")],
+    }
+
     for e in configs.values():
         if e["status"] in ("SKIPPED", "UNSUPPORTED"):
             continue
@@ -302,7 +313,7 @@ def analyze(lines):
         }
     return {
         "expected_configurations": expected, "measurements": measurements, "confirm_ms": confirm_ms,
-        "plan": plan_fields.get("name"), "configs": configs, "attempt_order": order,
+        "plan": plan_fields.get("name"), "highspeed": hs, "configs": configs, "attempt_order": order,
         "c6_sessions": len(sessions), "c6_phases": c6_phases, "c6_session_lines": sessions,
         "best": best["id"] if best else None, "announced_best": announced, "summary_present": summary is not None,
         "confirmation": confirmation,
@@ -413,7 +424,7 @@ def checks(report):
                         {mode: c["modes"].get(mode, {}).get("duration_us") for mode in MODES}))
             out.append(("confirmation is error-free", c["clean"], "check", c.get("errors", [])))
     reference = configs.get(0)
-    if report["plan"] in ("smoke", "qualified", "full"):
+    if report["plan"] in ("smoke", "qualified", "full", "hs"):
         # Configuration 0 of these plans is the qualified one (400 kHz, 1 bit, 64 bytes). A run
         # that cannot measure it cleanly in the three directions must not let the campaign go on.
         # A reference configuration that is missing or half measured is missing evidence; only an
@@ -425,6 +436,17 @@ def checks(report):
                     reference and {"status": reference["status"], "errors": reference["errors"][:2]}))
         out.append(("a best configuration exists", report["best"] is not None,
                     "check" if demonstrated else "require", report["best"]))
+    if report["plan"] == "hs":
+        hs = report["highspeed"]
+        # The purpose of this plan: the C6 slave advertises high speed once the bus is exposed.
+        # An error at 40 MHz is a result of the benchmark, never this check.
+        exposed = [f.get("shs") for f in hs["c6_exposed"]]
+        out.append(("the C6 reports that it advertises high speed once the bus is exposed",
+                    bool(exposed) and all(v == "1" for v in exposed), "check" if exposed else "require", exposed))
+        seen = list(hs["p4_cccr_speed"])
+        out.append(("the P4 reads SHS in the CCCR of the C6",
+                    bool(seen) and all(_int(v.replace("0x", ""), 0, 16) & 1 for v in seen),
+                    "check" if seen else "require", seen))
     lines_bound = 40 + n * (3 * (1 + max(m, 1)) + 4)
     out.append(("no per-packet logging", report["p4_bench_lines"] <= lines_bound, "check",
                 (report["p4_bench_lines"], lines_bound)))
@@ -450,4 +472,11 @@ def render_markdown(report):
     text = "\n".join(rows) + f"\n\nBest error-free configuration (round-trip goodput): {best}\n"
     if report["confirmation"]:
         text += f"Confirmation: {report['confirmation']}\n"
+    hs = report.get("highspeed")
+    if report["plan"] == "hs" and hs:
+        text += "\nHigh speed configuration\n"
+        text += f"- C6 registers when the bus is exposed: {hs['c6_exposed']}\n"
+        text += f"- CCCR 0x13 read by the P4 at the qualified setting: {hs['p4_cccr_speed']}\n"
+        text += "".join(f"- EHS negotiation: {n}\n" for n in hs["negotiations"])
+        text += "".join(f"- C6 after phase {i}: {r}\n" for i, r in sorted(hs["c6_phases"].items()))
     return text

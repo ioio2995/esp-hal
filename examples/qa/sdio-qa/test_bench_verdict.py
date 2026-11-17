@@ -367,3 +367,64 @@ def test_a_confirmation_phase_never_served_by_the_c6_is_not_a_pass():
     lines = [x for x in lines if not (x.board == "C6" and x.kind == "bench_phase" and "count=6000" in x.body
                                       and "mode=c6_to_p4" in x.body)]
     assert evaluate(lines).status != "PASS"
+
+
+def hs_run(shs_exposed="1", cccr="0x01", kinds=("clean", "clean", "clean", "clean", "clean")):
+    """A `hs` plan capture with the high speed findings of the C6 and of the P4."""
+    lines = tb_make(kinds)
+    first_boot = next(i for i, x in enumerate(lines) if x.board == "C6" and x.kind == "boot")
+    extra = []
+    if shs_exposed is not None:
+        extra.append(L("C6", f"bench_regs|when=exposed|shs={shs_exposed}|ehs=0|hinf_cfg_data1=0x00000004|slchost_conf=0x08000000"))
+    lines = lines[:first_boot + 1] + extra + lines[first_boot + 1:]
+    if cccr is not None:
+        lines.insert(2, L("P4", f"bench_caps|sdio_revision=0x32|card_capability=0x17|bus_interface=0x40|bus_speed={cccr}|fn1_block_size=0"))
+    return lines
+
+
+def tb_make(kinds):
+    table = [(400_000, 64), (20_000_000, 64), (40_000_000, 64), (20_000_000, 4096), (40_000_000, 4096)]
+    cfgs_ = [{"id": i, "hz": table[i][0], "width": 1, "size": table[i][1], "kind": kind} for i, kind in enumerate(kinds)]
+    return make(cfgs_, plan="hs")
+
+
+def test_the_hs_plan_passes_when_the_c6_advertises_high_speed_and_the_p4_reads_shs():
+    result = evaluate_plan("bench-hs", hs_run())
+    assert result.status == "PASS", [c for c in result.checks if not c["ok"]]
+    assert result.report["highspeed"]["c6_exposed"][0]["shs"] == "1"
+
+
+def test_the_hs_plan_fails_when_the_c6_does_not_advertise_high_speed():
+    assert evaluate_plan("bench-hs", hs_run(shs_exposed="0")).status == "FAIL"
+
+
+def test_the_hs_plan_fails_when_the_p4_reads_no_shs_bit_in_the_cccr():
+    assert evaluate_plan("bench-hs", hs_run(cccr="0x00")).status == "FAIL"
+
+
+def test_the_hs_plan_without_the_c6_registers_is_indeterminate():
+    assert evaluate_plan("bench-hs", hs_run(shs_exposed=None)).status == "INDETERMINATE"
+
+
+def test_the_hs_plan_without_the_p4_capability_line_is_indeterminate():
+    assert evaluate_plan("bench-hs", hs_run(cccr=None)).status == "INDETERMINATE"
+
+
+def test_an_error_at_40_mhz_is_a_result_of_the_hs_plan_not_a_failure():
+    kinds = ("clean", "clean", "error", "clean", "error")
+    result = evaluate_plan("bench-hs", hs_run(kinds=kinds))
+    assert result.status == "PASS", [c for c in result.checks if not c["ok"]]
+    assert result.report["configs"]["2"]["status"] == "ERROR"
+
+
+def test_the_hs_plan_reference_configuration_must_be_clean():
+    assert evaluate_plan("bench-hs", hs_run(kinds=("error", "clean", "clean", "clean", "clean"))).status == "FAIL"
+
+
+def test_the_hs_report_lists_the_registers_and_the_negotiation():
+    text = evaluate_plan("bench-hs", hs_run()).report["markdown"]
+    assert "High speed configuration" in text and "bench_regs" not in text and "shs" in text
+
+
+def evaluate_plan(scenario, lines):
+    return verdict.evaluate(scenario, lines)[scenario]

@@ -163,3 +163,11 @@ def test_benchmark_images_are_validated_like_the_others(case):
     build["artifacts"] = [a for a in build["artifacts"] if not (a["scenario"] == "bench-smoke" and a["role"] == "slave")]
     with pytest.raises(inputs.InputError, match="bench-smoke"):
         inputs.validate(params, consent, build, directory)
+
+
+def test_the_hs_plan_needs_its_own_observation_time(case):
+    params, consent, build, directory = case
+    consent["scenarios"] = ["bench-hs"]
+    with pytest.raises(inputs.InputError, match="scenario_timeouts.bench-hs"):
+        inputs.validate(params, consent, build, directory)
+    assert inputs.BENCH_TIMEOUT_S["bench-hs"] == 600

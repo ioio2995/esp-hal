@@ -210,6 +210,15 @@ async fn send_summary(
     transmit(slave, (descriptor, buffer), CONTROL_LENGTH).await
 }
 
+/// The raw registers that describe the high speed configuration: `HINF_CFG_DATA1` (bit 2 SHS
+/// advertised, bit 3 EHS selected by the host, and the sampling configuration) and `SLCHOST_CONF`
+/// (bit 27 `HSPEED_CON_EN` and the edge force bits). Read only, outside every timed phase.
+fn registers(slave: &SdioSlave<'_, Async>) -> (u32, u32, bool, bool) {
+    let snapshot = slave.snapshot();
+    let slchost_conf = esp_hal::peripherals::SLCHOST::regs().conf().read().bits();
+    (snapshot.cfg_data1, slchost_conf, snapshot.highspeed_advertised(), snapshot.highspeed_selected())
+}
+
 async fn run_phase(
     slave: &mut SdioSlave<'_, Async>,
     mut storage: Storage,
@@ -232,8 +241,9 @@ async fn run_phase(
     }
     let storage = send_summary(slave, storage, control.phase, &stats).await?;
     // Printed after the phase: nothing is printed while packets flow.
+    let (cfg_data1, slchost_conf, shs, ehs) = registers(slave);
     qa!(
-        "bench_phase|id={}|mode={}|length={}|count={}|packets_ok={}|bytes_ok={}|content_errors={}|first_error_byte={}|first_error_seq={}",
+        "bench_phase|id={}|mode={}|length={}|count={}|packets_ok={}|bytes_ok={}|content_errors={}|first_error_byte={}|first_error_seq={}|shs={}|ehs={}|hinf_cfg_data1={:#010x}|slchost_conf={:#010x}",
         control.phase,
         control.mode.name(),
         control.length,
@@ -242,7 +252,11 @@ async fn run_phase(
         stats.bytes_ok,
         stats.content_errors,
         stats.first_error_byte as i32,
-        stats.first_error_seq as i32
+        stats.first_error_seq as i32,
+        shs as u8,
+        ehs as u8,
+        cfg_data1,
+        slchost_conf
     );
     Ok(storage)
 }
@@ -250,6 +264,15 @@ async fn run_phase(
 async fn serve(bus: &mut Bus, storage: Storage) -> Res<()> {
     let mut slave = bus.session();
     slave.enable_bus().map_err(err("enable_bus"))?;
+    // Before the host has read anything: what the driver configured when it exposed the bus.
+    let (cfg_data1, slchost_conf, shs, ehs) = registers(&slave);
+    qa!(
+        "bench_regs|when=exposed|shs={}|ehs={}|hinf_cfg_data1={:#010x}|slchost_conf={:#010x}",
+        shs as u8,
+        ehs as u8,
+        cfg_data1,
+        slchost_conf
+    );
     let mut storage = storage;
     let mut first = true;
     loop {

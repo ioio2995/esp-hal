@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import importlib.util
 
-BENCH_PLANS = ("smoke", "qualified", "w1", "w4", "full")
+BENCH_PLANS = ("smoke", "qualified", "w1", "w4", "full", "hs")
 BENCH_SCENARIOS = tuple("bench-" + plan for plan in BENCH_PLANS)
 SCENARIOS = ("h1", "h2", "h3", "h4", "h567", "c6ctl") + BENCH_SCENARIOS  # c6ctl: P4 image only
 FIRMWARE = {
