@@ -133,6 +133,18 @@ pub struct RegisterSnapshot {
     pub slc1_interrupt_raw: u32,
 }
 
+impl RegisterSnapshot {
+    /// Whether the CCCR advertises high speed support (`SHS`): `HINF_CFG_DATA1.HIGHSPEED_ENABLE`.
+    pub const fn highspeed_advertised(&self) -> bool {
+        state::highspeed_advertised(self.cfg_data1)
+    }
+
+    /// Whether the host has selected high speed (`EHS`): `HINF_CFG_DATA1.HIGHSPEED_MODE`.
+    pub const fn highspeed_selected(&self) -> bool {
+        state::highspeed_selected(self.cfg_data1)
+    }
+}
+
 /// SDIO Slave controller with exclusive ownership of one SLC0 packet.
 pub struct SdioSlave<'d, Dm: DriverMode = Blocking> {
     _hinf: HINF<'d>,
@@ -299,9 +311,10 @@ impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
     /// 3. Selects IO MUX function 0 on the six pads and enables their input. The output direction
     ///    of the pads is left to the controller.
     ///
-    /// The CCCR, FBR and CIS keep their reset values, and the interrupts and
-    /// DMA are not touched. A successful return does not prove that a host can
-    /// enumerate the card.
+    /// The CCCR advertises high speed support (`SHS`, `HINF_CFG_DATA1.HIGHSPEED_ENABLE`) before the
+    /// pads are routed; the host still has to select it (`EHS`). The other CCCR fields, the FBR and
+    /// the CIS keep their reset values, and the interrupts and DMA are not touched. A successful
+    /// return does not prove that a host can enumerate the card.
     ///
     /// # Errors
     ///
@@ -315,6 +328,9 @@ impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
         let next = State::BusExposed;
 
         self.clear_function_ready();
+        // The CCCR must advertise high speed before a host can read it: the pads are handed over
+        // below, so this comes first.
+        self.advertise_highspeed();
 
         for pad in self.pads.iter().flatten() {
             // Known starting point: no output forced by the GPIO matrix, hold
@@ -914,6 +930,16 @@ impl<'d, Dm: DriverMode> SdioSlave<'d, Dm> {
         SLC::regs()
             .slc0int_clr()
             .write(|w| unsafe { w.bits(mask & DMA_EVENTS) });
+    }
+
+    /// Sets `HIGHSPEED_ENABLE` so that the CCCR advertises high speed support (`SHS`). Only that
+    /// field is written: the other fields of `HINF_CFG_DATA1` keep their value. Advertising
+    /// the capability does not make the host use it, and does not prove that the timing of
+    /// the bus is valid at a high frequency.
+    fn advertise_highspeed(&self) {
+        HINF::regs()
+            .cfg_data1()
+            .modify(|_, w| w.highspeed_enable().set_bit());
     }
 
     fn clear_function_ready(&self) {

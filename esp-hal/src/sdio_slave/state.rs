@@ -198,3 +198,21 @@ impl core::fmt::Display for Error {
 }
 
 impl core::error::Error for Error {}
+
+/// `HIGHSPEED_ENABLE` in `HINF_CFG_DATA1_REG` (bit 2, read/write, reset value 0): makes the CCCR
+/// advertise high speed support (`SHS`) to the host (ESP32-C6 TRM, chapter 34).
+pub const CFG_DATA1_HIGHSPEED_ENABLE: u32 = 1 << 2;
+
+/// `HIGHSPEED_MODE` in `HINF_CFG_DATA1_REG` (bit 3, read only): reflects the high speed mode
+/// (`EHS`) that the host selected in the CCCR.
+pub const CFG_DATA1_HIGHSPEED_MODE: u32 = 1 << 3;
+
+/// Whether `cfg_data1` makes the card advertise high speed support (`SHS`).
+pub const fn highspeed_advertised(cfg_data1: u32) -> bool {
+    cfg_data1 & CFG_DATA1_HIGHSPEED_ENABLE != 0
+}
+
+/// Whether the host has selected the high speed mode (`EHS`) according to `cfg_data1`.
+pub const fn highspeed_selected(cfg_data1: u32) -> bool {
+    cfg_data1 & CFG_DATA1_HIGHSPEED_MODE != 0
+}
