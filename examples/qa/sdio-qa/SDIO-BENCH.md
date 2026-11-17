@@ -115,7 +115,10 @@ Same protections as the qualification: the images (`sdio-bench-host`, `sdio-benc
 the restoration. The operator's consent lists the scenarios and `parameters.json` gives the
 observation time (`scenario_timeouts`, at least 90 s for `smoke`, 600 for `qualified`, 1500 for
 `w1`, 1800 for `w4`, 3300 for `full`). Run `smoke` first, then `qualified`, before the ladders.
-The benchmark is long: keep the PC awake and the grants alive. The campaign renews both
+The benchmark is long: keep the PC awake and the grants alive. The server keeps only the last 2048
+events of a device and a C6 reset per configuration prints thousands of them, so the campaigns' own
+event windows are drained every 30 s during an observation; otherwise the close of a long plan
+finds them overflowed (`Server events lost; proof incomplete`). The campaign renews both
 reservations every 300 s during an observation; a failed renewal stops the observation, keeps the
 partial evidence and runs the cleanup. At the end, once the boards are restored, the campaign asks the
 operator to revoke the local grants and waits up to 5 minutes for them to disappear (`Campaign.close()`

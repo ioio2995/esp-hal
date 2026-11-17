@@ -31,6 +31,12 @@ class Campaign:
     def result(self, test_id, status, **kw):
         self.results.append((test_id, status))
 
+    def events(self):
+        self.drained = getattr(self, "drained", 0) + 1
+        if getattr(self, "lose_events", False):
+            raise AssertionError("Server events lost; proof incomplete")
+        return []
+
     def close(self):
         self.closed = True
 
@@ -584,3 +590,19 @@ def test_a_benchmark_asks_once_for_a_reset_if_the_p4_never_boots(world):
 def test_the_other_scenarios_still_ask_for_the_reset(world):
     go(world, ["h1"])
     assert any("boots the scenario" in c[1] for c in world["calls"] if c[0] == "gesture")
+
+
+def test_the_campaign_event_windows_are_drained_during_a_long_observation(world, monkeypatch):
+    monkeypatch.setattr(flow, "EVENTS_EVERY", 10)
+    world["params"]["scenario_timeouts"] = {"bench-smoke": 100}
+    go(world, ["bench-smoke"])
+    assert all(c.drained >= 3 for c in world["campaigns"].values())
+
+
+def test_a_lost_event_window_stops_the_observation_and_keeps_the_evidence(world, monkeypatch):
+    monkeypatch.setattr(flow, "EVENTS_EVERY", 10)
+    world["params"]["scenario_timeouts"] = {"bench-smoke": 100}
+    world["campaigns"]["c6"].lose_events = True
+    outcome = go(world, ["bench-smoke"])
+    assert isinstance(outcome.error, AssertionError)
+    assert (world["campaigns"]["p4"].directory / "uart-bench-smoke-lines.json").exists()

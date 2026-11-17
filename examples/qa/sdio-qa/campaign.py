@@ -196,6 +196,7 @@ def _drain(console):
             return
 
 
+EVENTS_EVERY = 30  # seconds between two drains of the campaigns' own event windows (the server keeps 2048)
 RENEW_EVERY = 300  # seconds between two renewals of the reservations during an observation
 
 
@@ -221,8 +222,16 @@ def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, 
         started, asked = clock(), False
         deadline = started + params.get("scenario_timeouts", {}).get(
             scenario, params.get("scenario_timeout_seconds", 90))
-        renewed = started
+        renewed = drained = started
         while clock() < deadline:
+            if clock() - drained >= EVENTS_EVERY:
+                # The server keeps only the last 2048 events of a device. The campaign's own proof
+                # window is read at the close: a long run (a C6 reset per configuration prints
+                # thousands of events) would overflow it and invalidate the proof. Reading it now
+                # records the events as they come; a loss or an interruption still raises here.
+                for key in ("p4", "c6"):
+                    campaigns[key].events()
+                drained = clock()
             if bench and not asked and clock() - started >= START_WAIT_S and not any(
                     x.board == "P4" and x.kind == "boot" for x in consoles["p4"].assembler.lines):
                 asked = True
