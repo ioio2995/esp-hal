@@ -58,6 +58,19 @@ def _c6_sessions(lines):
     return sessions
 
 
+def _records(report):
+    """Every measurement of the run: warm-ups, short windows and the confirmation."""
+    for e in report["configs"].values():
+        for mode in MODES:
+            data = e["modes"][mode]
+            if data["warmup"]:
+                yield e, mode, "warmup", data["warmup"]
+            for w in data["windows"]:
+                yield e, mode, f"window{w['window']}", w
+        for mode, w in e.get("confirm", {}).items():
+            yield e, mode, "confirm", w
+
+
 def analyze(lines):
     """Builds the report. Never raises on a truncated log: what is missing is reported."""
     plan = next(iter(_lines(lines, "P4", "bench_plan")), None)
@@ -99,7 +112,9 @@ def analyze(lines):
             e = entry(_int(f.get("cfg")), f)
             e["modes"][f.get("mode")]["windows"].append(_measurement(f))
         elif x.kind == "bench_confirm":
-            entry(_int(f.get("cfg")), f).setdefault("confirm", {})[f.get("mode")] = _measurement(f)
+            record = _measurement(f)
+            record["params"] = (_int(f.get("requested_hz")), _int(f.get("width")), _int(f.get("size")))
+            entry(_int(f.get("cfg")), f).setdefault("confirm", {})[f.get("mode")] = record
         elif x.kind == "bench_error":
             e = entry(_int(f.get("cfg")), f)
             reason = re.search(r"reason=([^|]*)", x.body)
@@ -196,30 +211,34 @@ def checks(report):
     incomplete = [e["id"] for e in configs.values() if e["status"] == "INCOMPLETE"]
     out.append(("no configuration is left half measured", not incomplete, "require", incomplete[:10]))
 
-    bad_math = []
-    for e in configs.values():
-        for mode in MODES:
-            for w in e["modes"][mode]["windows"] + ([e["modes"][mode]["warmup"]] if e["modes"][mode]["warmup"] else []):
-                expected = w["useful_bytes"] * 1_000_000 // w["duration_us"] if w["duration_us"] else 0
-                if abs(expected - w["goodput_bps"]) > 1:
-                    bad_math.append((e["id"], mode, w["window"]))
+    bad_math, bad_bytes, absent, disagreements = [], [], [], []
+    for e, mode, label, w in _records(report):
+        where = (e["id"], mode, label)
+        # 1. goodput is the useful bytes over the effective duration
+        expected = w["useful_bytes"] * 1_000_000 // w["duration_us"] if w["duration_us"] else 0
+        if abs(expected - w["goodput_bps"]) > 1:
+            bad_math.append(where)
+        # 2. the useful bytes are the packets x the size x the directions, not a free number
+        directions = 2 if mode == "round_trip" else 1
+        if w["packets"] < 1 or w["useful_bytes"] != w["packets"] * e["size"] * directions:
+            bad_bytes.append(where)
+        # 3. the C6 confirms the phase it served (parameters, and what it validated)
+        c6 = report["c6_phases"].get(w["phase"])
+        if c6 is None:
+            absent.append(where)
+            continue
+        served = (_int(c6.get("count")) == w["packets"] and _int(c6.get("length")) == e["size"]
+                  and c6.get("mode") == mode)
+        validated = _int(c6.get("packets_ok")) == (w["packets"] if mode in SENDS else 0)
+        bytes_ok = _int(c6.get("bytes_ok")) == (w["packets"] * e["size"] if mode in SENDS else 0)
+        if (not served or not validated or not bytes_ok or _int(c6.get("content_errors")) != 0
+                or w["c6_packets_ok"] != _int(c6.get("packets_ok")) or w["c6_bytes_ok"] != _int(c6.get("bytes_ok"))):
+            disagreements.append(where)
     out.append(("goodput equals useful bytes over effective duration", not bad_math, "check", bad_math[:5]))
-
-    # C6 cross-check: every P4 phase in which the C6 validates is confirmed by the C6.
-    disagreements, absent = [], []
-    for e in configs.values():
-        for mode in MODES:
-            if mode not in SENDS:
-                continue
-            for w in e["modes"][mode]["windows"]:
-                c6 = report["c6_phases"].get(w["phase"])
-                if c6 is None:
-                    absent.append((e["id"], mode, w["window"]))
-                elif (_int(c6.get("packets_ok")) != w["packets"] or _int(c6.get("content_errors")) != 0
-                      or _int(c6.get("bytes_ok")) != w["c6_bytes_ok"]):
-                    disagreements.append((e["id"], mode, w["window"]))
-    out.append(("the C6 confirms every phase it validated", not absent, "require", absent[:5]))
-    out.append(("the C6 and the P4 agree on packets, bytes and content", not disagreements, "check", disagreements[:5]))
+    out.append(("useful bytes equal packets x size x directions", not bad_bytes, "check", bad_bytes[:5]))
+    out.append(("the C6 confirms every phase it served", not absent, "require", absent[:5]))
+    out.append(("the C6 and the P4 agree on parameters, packets, bytes and content", not disagreements, "check",
+                disagreements[:5]))
 
     # A configuration the P4 calls clean must have a quiet C6 session.
     sessions = report["c6_session_lines"]
@@ -244,11 +263,27 @@ def checks(report):
         c = report["confirmation"]
         out.append(("the best configuration was confirmed", c is not None, "require", ""))
         if c:
+            best = configs[report["best"]]
+            wanted = (best["requested_hz"], best["width"], best["size"])
+            confirmed = {mode: c["modes"].get(mode, {}).get("params") for mode in MODES}
+            out.append(("the confirmed configuration is the best one, announced and computed, with the same parameters",
+                        c["cfg"] == report["best"] == report["announced_best"]
+                        and all(p == wanted for p in confirmed.values()), "check",
+                        {"best": report["best"], "announced": report["announced_best"], "confirmed": c["cfg"],
+                         "parameters": confirmed}))
             long_enough = all(c["modes"].get(mode, {}).get("duration_us", 0) >= report["confirm_ms"] * 900
                               for mode in MODES)
             out.append(("confirmation ran for the full duration in every direction", long_enough, "check",
                         {mode: c["modes"].get(mode, {}).get("duration_us") for mode in MODES}))
-            out.append(("confirmation is error-free", c["clean"], "check", ""))
+            out.append(("confirmation is error-free", c["clean"], "check", c.get("errors", [])))
+    reference = configs.get(0)
+    if report["plan"] in ("smoke", "qualified", "full"):
+        # Configuration 0 of these plans is the qualified one (400 kHz, 1 bit, 64 bytes). A run
+        # that cannot measure it cleanly in the three directions must not let the campaign go on.
+        out.append(("the qualified reference configuration is clean in the three directions",
+                    reference is not None and reference["status"] == "CLEAN", "check",
+                    reference and {"status": reference["status"], "errors": reference["errors"][:2]}))
+        out.append(("a best configuration exists", report["best"] is not None, "check", report["best"]))
     lines_bound = 40 + n * (3 * (1 + max(m, 1)) + 4)
     out.append(("no per-packet logging", report["p4_bench_lines"] <= lines_bound, "check",
                 (report["p4_bench_lines"], lines_bound)))

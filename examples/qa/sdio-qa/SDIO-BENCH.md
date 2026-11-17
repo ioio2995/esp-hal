@@ -93,12 +93,17 @@ window, packets and **useful bytes validated** (both directions for the round tr
 duration**, goodput (useful bytes per second), packets per second, round-trip latency (minimum,
 mean, maximum), error classes, `not_ready_polls`, and what the C6 validated. The evaluator
 (`bench_verdict.py`) cross-checks every P4 phase against the C6 summary, requires the goodput to
-equal bytes over duration, derives the best error-free configuration itself and compares it to the
+equal bytes over duration, requires the useful bytes to equal packets x size x directions, applies
+the same checks (and the P4/C6 cross-check of every phase, parameters and counters included) to the
+warm-ups, the windows and the 30-second confirmation, requires the confirmed configuration to be the
+computed best, the announced best and to carry the same parameters, derives the best error-free configuration itself and compares it to the
 one the firmware chose, checks the 30-second confirmation, and bounds the number of log lines (no
 per-packet logging). It writes `verdict-bench-<plan>.json` (every check, never truncated) and a
 markdown table `report-bench-<plan>.md` in the evidence folders. **The run is a PASS when it
-completed and the two logs agree; errors found by the benchmark are findings in the report, not
-failures of the run.** The source SHA and the SHA-256 of the images are those of the build
+completed and the two logs agree; errors found on exploratory steps are findings in the report, not
+failures of the run. The exception is the reference configuration (configuration 0 of `smoke`,
+`qualified` and `full`: 400 kHz, 1 bit, 64 bytes), which must be clean in the three directions:
+otherwise the verdict is FAIL and the campaign stops.** The source SHA and the SHA-256 of the images are those of the build
 manifest (`build.py`), recorded with the evidence, not in the pull request.
 
 ## Running it
@@ -108,7 +113,9 @@ Same protections as the qualification: the images (`sdio-bench-host`, `sdio-benc
 the restoration. The operator's consent lists the scenarios and `parameters.json` gives the
 observation time (`scenario_timeouts`, at least 90 s for `smoke`, 600 for `qualified`, 1500 for
 `w1`, 1800 for `w4`, 3300 for `full`). Run `smoke` first, then `qualified`, before the ladders.
-The benchmark is long: keep the PC awake and the grants alive.
+The benchmark is long: keep the PC awake and the grants alive. The campaign renews both
+reservations every 300 s during an observation; a failed renewal stops the observation, keeps the
+partial evidence and runs the cleanup.
 
 ## Limits to keep in mind
 

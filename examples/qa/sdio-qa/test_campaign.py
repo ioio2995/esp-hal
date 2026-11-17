@@ -446,3 +446,30 @@ def test_a_benchmark_scenario_uses_its_own_timeout_and_saves_the_complete_verdic
     assert full["status"] == "INDETERMINATE" and len(full["checks"]) > 3
     assert outcome.failed_verdicts == {"bench-smoke": "INDETERMINATE"}
     assert ("restore", "c6") in world["calls"]  # the usual cleanup still runs
+
+
+def test_reservations_are_renewed_during_a_long_observation(world, monkeypatch):
+    monkeypatch.setattr(flow, "RENEW_EVERY", 10)
+    world["params"]["scenario_timeouts"] = {"bench-smoke": 100}
+    before = sum(1 for c in world["calls"] if c[0] == "renew")
+    go(world, ["bench-smoke"])
+    assert sum(1 for c in world["calls"] if c[0] == "renew") - before >= 2 * 5
+
+
+def test_a_failed_renewal_stops_the_observation_and_keeps_the_evidence(world, monkeypatch):
+    monkeypatch.setattr(flow, "RENEW_EVERY", 10)
+    world["params"]["scenario_timeouts"] = {"bench-smoke": 100}
+
+    def make_broken(board):
+        original = board.renew
+
+        def broken(ttl):
+            if any(c[0] == "gesture" and "boots the scenario" in c[1] for c in world["calls"]):  # observing
+                raise RuntimeError("lease expired")
+            return original(ttl)
+        return broken
+    for key in ("p4", "c6"):
+        world["boards"][key].renew = make_broken(world["boards"][key])
+    outcome = go(world, ["bench-smoke"])
+    assert outcome.error is not None or outcome.verdicts == {}
+    assert (world["campaigns"]["p4"].directory / "uart-bench-smoke-lines.json").exists()

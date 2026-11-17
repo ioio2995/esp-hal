@@ -35,10 +35,16 @@ def result_line(tag, cfg, mode, window, phase, packets, length, micros):
                     f"c6_bytes_ok={0 if mode == 'c6_to_p4' else packets * length}"))
 
 
+def c6_phase(phase, mode, size, count, errors=0):
+    sends = mode != "c6_to_p4"
+    return L("C6", f"bench_phase|id={phase}|mode={mode}|length={size}|count={count}|packets_ok={count if sends else 0}|"
+                   f"bytes_ok={count * size if sends else 0}|content_errors={errors}|first_error_byte=-1|first_error_seq=-1")
+
+
 def make(configs, confirm=True, c6_content_errors=0, drop_c6_phase=None, measurements=3, confirm_us=30_500_000,
-         confirm_clean=True, extra_p4=0):
+         confirm_clean=True, extra_p4=0, confirm_c6_errors=0, confirm_cfg=None, plan="test"):
     """P4 and C6 lines for the configurations, each `kind` being clean, error, skip or unsupported."""
-    p4 = [L("P4", f"bench_plan|name=test|configurations={len(configs)}|module_hz=80000000|measurements={measurements}|"
+    p4 = [L("P4", f"bench_plan|name={plan}|configurations={len(configs)}|module_hz=80000000|measurements={measurements}|"
                   f"window_ms=5000|confirm_ms={30000 if confirm else 0}|warmup_packets=8")]
     c6, phase, best = [], 0, None
     for cfg in configs:
@@ -55,9 +61,7 @@ def make(configs, confirm=True, c6_content_errors=0, drop_c6_phase=None, measure
         for mode in MODES:
             phase += 1
             p4.append(result_line("bench_warmup", cfg, mode, 0, phase, 8, cfg["size"], 10_000))
-            if mode != "c6_to_p4":
-                c6.append(L("C6", f"bench_phase|id={phase}|mode={mode}|length={cfg['size']}|count=8|packets_ok=8|"
-                                  f"bytes_ok={8 * cfg['size']}|content_errors=0|first_error_byte=-1|first_error_seq=-1"))
+            c6.append(c6_phase(phase, mode, cfg["size"], 8))
             if cfg["kind"] == "error" and mode == "c6_to_p4":
                 p4.append(L("P4", f"bench_error|cfg={cfg['id']}|requested_hz={cfg['hz']}|actual_hz={cfg['hz']}|"
                                   f"width={cfg['width']}|size={cfg['size']}|mode={mode}|window=1|packets_before_error=17|"
@@ -67,17 +71,15 @@ def make(configs, confirm=True, c6_content_errors=0, drop_c6_phase=None, measure
                 phase += 1
                 micros = 5_000_000 + window * 1000
                 p4.append(result_line("bench_result", cfg, mode, window, phase, 1000, cfg["size"], micros))
-                if mode != "c6_to_p4" and phase != drop_c6_phase:
-                    c6.append(L("C6", f"bench_phase|id={phase}|mode={mode}|length={cfg['size']}|count=1000|"
-                                      f"packets_ok=1000|bytes_ok={1000 * cfg['size']}|content_errors={c6_content_errors}|"
-                                      "first_error_byte=-1|first_error_seq=-1"))
+                if phase != drop_c6_phase:
+                    c6.append(c6_phase(phase, mode, cfg["size"], 1000, c6_content_errors))
         if cfg["kind"] == "clean":
             rate = 2000 * cfg["size"] * 1_000_000 // 5_001_000
             if best is None or rate > best[1]:
                 best = (cfg, rate)
     p4.append(L("P4", f"bench_summary|measured_clean=1|failed=0|skipped=0|unsupported=0|best_cfg={'Some(%d)' % best[0]['id'] if best else 'None'}"))
     if confirm and best:
-        cfg = best[0]
+        cfg = configs[confirm_cfg] if confirm_cfg is not None else best[0]
         p4.append(L("P4", f"bench_best|cfg={cfg['id']}|requested_hz={cfg['hz']}|actual_hz={cfg['hz']}|width={cfg['width']}|"
                           f"size={cfg['size']}|round_trip_goodput_bps={best[1]}"))
         p4.append(L("P4", f"bench_config|cfg={cfg['id']}|plan=test|requested_hz={cfg['hz']}|actual_hz={cfg['hz']}|"
@@ -86,8 +88,10 @@ def make(configs, confirm=True, c6_content_errors=0, drop_c6_phase=None, measure
         for mode in MODES:
             phase += 1
             p4.append(result_line("bench_warmup", cfg, mode, 0, phase, 8, cfg["size"], 10_000))
+            c6.append(c6_phase(phase, mode, cfg["size"], 8))
             phase += 1
             p4.append(result_line("bench_confirm", cfg, mode, 1, phase, 6000, cfg["size"], confirm_us))
+            c6.append(c6_phase(phase, mode, cfg["size"], 6000, confirm_c6_errors))
         p4.append(L("P4", f"bench_confirmed|cfg={cfg['id']}|clean={'true' if confirm_clean else 'false'}"))
     p4 += [L("P4", "bench_noise|x=1")] * 0
     p4 += [L("P4", f"bench_result_flood|n={i}") for i in range(extra_p4)]
@@ -209,3 +213,63 @@ def test_c6_failure_in_a_clean_configuration_session_is_a_contradiction():
     first_boot = next(i for i, x in enumerate(lines) if x.board == "C6" and x.kind == "boot")
     lines.insert(first_boot + 1, L("C6", "fail|receive timed out|Elapsed"))
     assert evaluate(lines).status == "FAIL"
+
+
+def retag(lines, kind, old, new):
+    return [verdict.Line(x.board, 1, x.body.replace(old, new)) if x.kind == kind else x for x in lines]
+
+
+def test_confirmation_of_another_configuration_fails():
+    # best is configuration 1 (larger packets); configuration 0 is confirmed instead
+    assert evaluate(make(cfgs("clean", "clean"), confirm_cfg=0)).status == "FAIL"
+
+
+def test_confirmation_with_other_parameters_fails():
+    lines = retag(make(cfgs("clean", "clean")), "bench_confirm", "size=256", "size=64")
+    assert evaluate(lines).status == "FAIL"
+
+
+def test_c6_content_error_on_the_confirmation_fails():
+    assert evaluate(make(cfgs("clean"), confirm_c6_errors=1)).status == "FAIL"
+
+
+def test_wrong_goodput_on_the_confirmation_fails():
+    lines = retag(make(cfgs("clean")), "bench_confirm", "goodput_bps=", "goodput_bps=9")
+    assert evaluate(lines).status == "FAIL"
+
+
+def test_missing_c6_proof_for_the_confirmation_is_indeterminate():
+    lines = make(cfgs("clean"))
+    lines = [x for x in lines if not (x.board == "C6" and x.kind == "bench_phase" and "count=6000" in x.body and "mode=round_trip" in x.body)]
+    assert evaluate(lines).status == "INDETERMINATE"
+
+
+def test_inflated_useful_bytes_with_a_recomputed_goodput_fail():
+    out = []
+    for x in make(cfgs("clean")):
+        if x.kind == "bench_result" and "window=1" in x.body and "mode=p4_to_c6" in x.body:
+            f = x.fields() if hasattr(x, "fields") else None
+            body = x.body
+            useful = int(body.split("useful_bytes=")[1].split("|")[0])
+            micros = int(body.split("duration_us=")[1].split("|")[0])
+            body = body.replace(f"useful_bytes={useful}", f"useful_bytes={useful * 10}")
+            old = body.split("goodput_bps=")[1].split("|")[0]
+            body = body.replace(f"goodput_bps={old}", f"goodput_bps={useful * 10 * 1_000_000 // micros}")
+            x = verdict.Line(x.board, 1, body)
+        out.append(x)
+    assert evaluate(out).status == "FAIL"
+
+
+def test_c6_validated_bytes_must_match_the_p4_figures():
+    lines = retag(make(cfgs("clean")), "bench_phase", "bytes_ok=64000", "bytes_ok=65000")
+    assert evaluate(lines).status == "FAIL"
+
+
+def test_smoke_with_a_crc_error_on_the_reference_fails():
+    result = evaluate(make(cfgs("error"), confirm=False, measurements=1, plan="smoke"))
+    assert result.status == "FAIL"
+    assert any(not c["ok"] and "reference" in c["check"] for c in result.checks)
+
+
+def test_exploratory_error_after_a_clean_reference_does_not_fail_the_run():
+    assert evaluate(make(cfgs("clean", "error"), plan="qualified")).status == "PASS"

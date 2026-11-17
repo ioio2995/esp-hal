@@ -181,7 +181,10 @@ def _c6_into_download(state, boards, orchestrators, make_console, gesture, sleep
     return _c6ctl("C6 RESET", state, boards, orchestrators, make_console, sleep, clock)
 
 
-def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, clock, state):
+RENEW_EVERY = 300  # seconds between two renewals of the reservations during an observation
+
+
+def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, clock, state, ttl=1800):
     consoles = {key: make_console(boards[key]) for key in ("p4", "c6")}
     state["p4_console"] = consoles["p4"]  # stays open for the control commands that follow
     error = None
@@ -197,7 +200,14 @@ def _observe(scenario, params, boards, campaigns, make_console, gesture, sleep, 
         gesture(f"{scenario}: reset the P4 so that it boots the scenario (it resets the C6 itself)")
         deadline = clock() + params.get("scenario_timeouts", {}).get(
             scenario, params.get("scenario_timeout_seconds", 90))
+        renewed = clock()
         while clock() < deadline:
+            if clock() - renewed >= RENEW_EVERY:
+                # A long benchmark outlives the reservation TTL. A failed renewal raises: the
+                # partial captures are saved as evidence and the cleanup runs, nothing continues.
+                for key in ("c6", "p4"):
+                    boards[key].renew(ttl=ttl)
+                renewed = clock()
             for console in consoles.values():
                 console.poll()
             lines = consoles["p4"].assembler.lines + consoles["c6"].assembler.lines
@@ -292,7 +302,7 @@ def run(params, consent, scenarios, regions, build, build_dir, campaigns, orches
                 prepared.add("p4")
             _program("p4", scenario, "host", *args, gesture, outcome, ttl, ask=False)
             lines = _observe(scenario, params, boards, campaigns, make_console, gesture, sleep,
-                             clock, state)
+                             clock, state, ttl)
             for test_id, result in verdict.evaluate(scenario, lines).items():
                 outcome.verdicts[test_id] = result
                 for key in ("p4", "c6"):
