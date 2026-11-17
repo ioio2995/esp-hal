@@ -163,5 +163,12 @@ make the run a pass of the revision that produced it.
 
 - One run per configuration after warm-up; three windows give a spread, not a statistical bound.
 - The goodput is that of this blocking, polling host and of the single-descriptor slave cycle.
-- 40 MHz uses the default sampling phase, untuned.
+- 40 MHz is not measured. The benchmark only enables a clock above 25 MHz if the CCCR advertises
+  high speed (SHS), and the C6 slave, as the current driver initializes it, reads `bus_speed = 0x00`
+  there. This is a limit of **our initialization of the C6, not of the hardware**, which is
+  documented up to 50 MHz. The driver only touches the function-ready bits of `HINF_CFG_DATA1`; it
+  writes no high-speed capability. A 40 MHz result needs a documented change of the initialization
+  (a production-driver change, so a separate decision, review and requalification), then a new
+  `w1`. Until then the four 40 MHz configurations stay `UNSUPPORTED` and out of the maximum.
+- If 40 MHz becomes available, the default sampling phase is used and is not tuned.
 - Whether the C6 accepts block mode, 4 bits or high speed is unknown until measured.
