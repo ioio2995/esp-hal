@@ -89,12 +89,21 @@ def select_session(lines, number):
     are therefore the next `configurations` C6 sessions after those of the earlier P4 sessions.
     That count is only reliable when every earlier P4 session reached its end marker: otherwise
     a reset may or may not have happened before the capture stopped, and the association is
-    ambiguous."""
+    ambiguous. It must also add up over the whole capture: C6 sessions missing anywhere (or extra)
+    make every attribution ambiguous, including that of an apparently complete session."""
     sessions = p4_sessions(lines)
     c6 = c6_sessions_with_boot(lines)
     if not 1 <= number <= len(sessions):
         raise AmbiguousAssociation(f"there are {len(sessions)} P4 sessions, not {number}")
     chosen = sessions[number - 1]
+    # The whole capture must add up before anything is attributed: every P4 session asked for its
+    # own C6 resets, so the C6 sessions captured must be exactly those (one more is allowed after a
+    # truncated last session: its reset may have happened before `bench_config` was printed).
+    expected = sum(session["configurations"] for session in sessions)
+    allowed = {expected, expected + 1} if not sessions[-1]["complete"] else {expected}
+    if len(c6) not in allowed:
+        raise AmbiguousAssociation(f"the {len(sessions)} P4 sessions asked for {expected} C6 sessions "
+                                   f"but {len(c6)} were captured: the evidence cannot be attributed")
     if chosen["headless"]:
         raise AmbiguousAssociation("the selected P4 session has no boot banner")
     before = sessions[:number - 1]

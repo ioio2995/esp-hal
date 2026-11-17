@@ -132,7 +132,7 @@ def test_the_association_is_ambiguous_when_the_c6_sessions_are_missing(tmp_path)
     last_boot = max(i for i, x in enumerate(c6) if x.kind == "boot")
     record = redo(tmp_path, capture((p4, c6[:last_boot])), 1)  # the confirmation's C6 session is gone
     assert record["reanalysed_verdict"]["status"] == "INDETERMINATE"
-    assert "only 1 were captured" in record["association_ambiguity"]
+    assert "cannot be attributed" in record["association_ambiguity"]
 
 
 def test_an_unknown_session_number_is_indeterminate(tmp_path):
@@ -164,3 +164,34 @@ def test_the_reanalysis_file_name_carries_the_session_and_nothing_is_overwritten
     assert one.name.endswith("-p4s1.json") and two.name.endswith("-p4s2.json") and one != two
     with pytest.raises(FileExistsError):
         re_.write_new(p4, re_.reanalyze(p4, c6, "bench-qualified", p4_session=1, identity=IDENTITY))
+
+
+def test_the_c6_sessions_of_the_first_plan_missing_never_borrow_those_of_the_second(tmp_path):
+    first, second = run_lines("clean", "clean"), run_lines("clean", "clean")  # identical plans
+    lines = first[0] + second[0] + second[1]  # both P4 plans, but only the second plan's C6 sessions
+    assert len(split(lines)[1]) == len(second[1]) > 0
+    for number in (1, 2):
+        record = redo(tmp_path / f"s{number}", lines, number) if (tmp_path / f"s{number}").mkdir() is None else None
+        assert record["reanalysed_verdict"]["status"] == "INDETERMINATE", number
+        assert "cannot be attributed" in record["association_ambiguity"]
+        assert record["session_association"] is None
+
+
+def test_a_missing_c6_session_in_the_middle_of_the_capture_makes_every_attribution_ambiguous(tmp_path):
+    first, second = run_lines("clean", "clean"), run_lines("clean", "clean")
+    boots = [i for i, x in enumerate(first[1]) if x.kind == "boot"]
+    damaged = (first[0], first[1][:boots[1]] + first[1][boots[2]:])  # the second C6 session of plan 1 is gone
+    record = redo(tmp_path, capture(damaged, second), 1)
+    assert record["reanalysed_verdict"]["status"] == "INDETERMINATE"
+
+
+def test_one_extra_c6_session_is_tolerated_only_after_a_truncated_last_plan(tmp_path):
+    full = run_lines("clean")
+    started = partial("clean")
+    extra = (started[0], started[1] + [tb.L("C6", "boot|firmware=sdio-bench-slave|plan=qualified")])
+    assert redo(tmp_path / "a", capture(full, extra), 1)["reanalysed_verdict"]["status"] == "PASS" \
+        if (tmp_path / "a").mkdir() is None else True
+    # an extra session after a COMPLETE last plan is not explained by a truncation
+    surplus = (full[0], full[1] + [tb.L("C6", "boot|firmware=sdio-bench-slave|plan=qualified")])
+    record = redo(tmp_path / "b", capture(surplus), 1) if (tmp_path / "b").mkdir() is None else None
+    assert record["reanalysed_verdict"]["status"] == "INDETERMINATE"
