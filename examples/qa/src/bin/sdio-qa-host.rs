@@ -76,6 +76,11 @@ mod voltage {
     }
 }
 
+// The H3 diagnostic relies on an explicit cache write-back before the DMA. Refuse to build if the
+// chip does not report cached internal memory, instead of silently omitting it.
+#[cfg(not(soc_internal_memory_cached))]
+compile_error!("the QA host needs soc_internal_memory_cached for its cache write-back");
+
 esp_bootloader_esp_idf::esp_app_desc!();
 
 /// Error text of a command that got no response during a deliberate probe.
@@ -105,6 +110,70 @@ fn fail<T>(step: &'static str, detail: impl core::fmt::Debug) -> Result<T> {
 /// Both cache lines of a transfer buffer belong to this allocation.
 #[repr(C, align(64))]
 struct Packet([u8; 128]);
+
+/// A read buffer surrounded by guard lines. Every region is a whole number of cache lines and the
+/// whole structure belongs to one transfer, so a write that reaches a guard came from outside the
+/// 128-byte data area.
+#[repr(C, align(64))]
+struct Guarded {
+    head: [u8; 64],
+    data: [u8; 128],
+    tail: [u8; 64],
+}
+
+const GUARD: u8 = 0xa5;
+
+impl Guarded {
+    fn new() -> Self {
+        Self {
+            head: [GUARD; 64],
+            data: [0xff; 128],
+            tail: [GUARD; 64],
+        }
+    }
+}
+
+/// Reports what the transfer left around the useful bytes. `nonff_in_rounding` counts bytes
+/// between the requested length and the word-rounded descriptor size, `nonff_beyond` those past
+/// that size. The data area was written back to memory before the DMA, so any such byte was
+/// written by the transfer, not brought back by a stale cache line. Returns whether the area
+/// outside the descriptor size and both guards are untouched.
+fn tail_report(label: &str, buffer: &Guarded, length: usize) -> bool {
+    let rounded = (length + 3) & !3;
+    let in_rounding = buffer.data[length..rounded]
+        .iter()
+        .filter(|byte| **byte != 0xff)
+        .count();
+    let beyond = &buffer.data[rounded..];
+    let count = beyond.iter().filter(|byte| **byte != 0xff).count();
+    let first = beyond.iter().position(|byte| *byte != 0xff).map(|i| i + rounded);
+    let last = beyond.iter().rposition(|byte| *byte != 0xff).map(|i| i + rounded);
+    let head_ok = buffer.head.iter().all(|byte| *byte == GUARD);
+    let tail_ok = buffer.tail.iter().all(|byte| *byte == GUARD);
+    qa!(
+        "tail_check|{}|length={}|rounded={}|nonff_in_rounding={}|nonff_beyond={}|first_beyond={:?}|last_beyond={:?}|head_guard_ok={}|tail_guard_ok={}|writeback_before_dma={}|after_length={:02x?}",
+        label,
+        length,
+        rounded,
+        in_rounding,
+        count,
+        first,
+        last,
+        head_ok,
+        tail_ok,
+        cfg!(soc_internal_memory_cached),
+        &buffer.data[length..(length + 8).min(128)]
+    );
+    if let Some(first) = first {
+        qa!(
+            "tail_dump|{}|from={}|bytes={:02x?}",
+            label,
+            first,
+            &buffer.data[first..(first + 16).min(128)]
+        );
+    }
+    count == 0 && head_ok && tail_ok
+}
 
 /// Host-side accounting of what this session has consumed. Recreated for every session.
 struct Accounting {
@@ -523,12 +592,20 @@ fn read_response(
             (credits, accounting.credits),
         );
     }
-    let mut packet = Packet([0xff; 128]);
+    let mut buffer = Guarded::new();
+    // Write the guards and the 0xff fill back to memory before the DMA. The read path invalidates
+    // the cache lines of the transfer afterwards; without this a stale line could bring old RAM
+    // content back into the untouched tail.
+    #[cfg(soc_internal_memory_cached)]
+    {
+        let mut whole = DmaAlignedMut::new(&mut buffer).map_err(|_| "unaligned guarded buffer")?;
+        whole.writeback();
+    }
     let response = host
         .read_blocks_blocking(
             53,
             cmd53_argument(length),
-            dma(&mut packet.0[..length])?,
+            dma(&mut buffer.data[..length])?,
             length as u16,
             1,
         )
@@ -538,22 +615,19 @@ fn read_response(
         })?;
     check_r5("cmd53_read", response)?;
     let expected_bytes: [u8; 65] = core::array::from_fn(expected);
-    let mismatch = first_mismatch(&packet.0[..length], &expected_bytes[..length]);
-    // Bytes past the requested length are an observation, not an assertion: the host DMA
-    // descriptor rounds its size up to a whole word.
+    let mismatch = first_mismatch(&buffer.data[..length], &expected_bytes[..length]);
     qa!(
         "response_check|{}|length={}|first_mismatch={:?}|tail={:02x?}",
         label,
         length,
         mismatch,
-        &packet.0[length..(length + 4).min(128)]
+        &buffer.data[length..(length + 4).min(128)]
     );
     if mismatch.is_some() {
         return fail("response payload mismatch", mismatch);
     }
-    let rounded = (length + 3) & !3;
-    if packet.0[rounded..].iter().any(|byte| *byte != 0xff) {
-        return fail("bytes were written beyond the word-rounded length", ());
+    if !tail_report(label, &buffer, length) {
+        return fail("the transfer altered bytes outside its descriptor size or a guard", ());
     }
     accounting.bytes = length_add(accounting.bytes, length as u32);
     qa!(

@@ -61,10 +61,16 @@ def h2():
     return log(*rows, *end("h2"))
 
 
+TAIL_OK = ("tail_check|odd_response|length=65|rounded=68|nonff_in_rounding=3|nonff_beyond=0|"
+           "first_beyond=None|last_beyond=None|head_guard_ok=true|tail_guard_ok=true|"
+           "writeback_before_dma=true|after_length=[c8, cb, ce, ff]")
+
+
 def h3():
     rows = boots("h3") + [("C6", "tx_done|dma_bytes=65"),
         ("P4", "length_observed|cum=65|ior1=false"), ("P4", "ready_observed|waited_ms=1"),
         ("P4", "response_check|odd_response|length=65|first_mismatch=None|tail=[ee]"),
+        ("P4", TAIL_OK),
         ("P4", "response_consumed|odd_response|bytes=65|bytes_consumed_cum=65|length_cum=65")]
     return log(*rows, *end("h3"))
 
@@ -217,3 +223,29 @@ def test_h1_needs_three_c6_terminations():
 def test_transient_not_ready_polls_are_informational():
     rows = h1() + log(("P4", "poll_not_ready|length|r5_flags=0x12|ior1=true"))
     assert verdict.evaluate("h1", rows)["h1"].status == "PASS"
+
+
+def _h3_with_tail(text):
+    rows = [x for x in h3() if x.kind != "tail_check"] + log(("P4", text))
+    return verdict.evaluate("h3", rows)["h3"].status
+
+
+def test_h3_tail_overrun_beyond_the_descriptor_fails():
+    assert _h3_with_tail(TAIL_OK.replace("nonff_beyond=0", "nonff_beyond=1")) == "FAIL"
+
+
+def test_h3_altered_guard_fails():
+    assert _h3_with_tail(TAIL_OK.replace("tail_guard_ok=true", "tail_guard_ok=false")) == "FAIL"
+
+
+def test_h3_without_writeback_does_not_pass():
+    assert _h3_with_tail(TAIL_OK.replace("writeback_before_dma=true", "writeback_before_dma=false")) == "FAIL"
+
+
+def test_h3_missing_tail_report_is_indeterminate():
+    rows = [x for x in h3() if x.kind != "tail_check"]
+    assert verdict.evaluate("h3", rows)["h3"].status == "INDETERMINATE"
+
+
+def test_h3_bytes_inside_the_word_rounding_are_only_an_observation():
+    assert _h3_with_tail(TAIL_OK) == "PASS"

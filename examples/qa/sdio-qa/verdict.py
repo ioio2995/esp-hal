@@ -187,6 +187,17 @@ def _h3(lines):
     v.sequence("slave DMA transmitted 65 bytes", _values(lines, "C6", "tx_done", "dma_bytes"),
                ["65"])
     v.check("no receive credit published", _values(lines, "P4", "credit_observed", "cum") == [])
+    tail = _of(lines, "P4", "tail_check", "|odd_response|")
+    v.require("tail check reported", len(tail) == 1, len(tail))
+    if tail:
+        f = tail[0].fields()
+        v.check("cache write-back preceded the DMA", f.get("writeback_before_dma") == "true",
+                f.get("writeback_before_dma"))
+        v.check("nothing written beyond the 68-byte descriptor size",
+                f.get("nonff_beyond") == "0",
+                {k: f.get(k) for k in ("nonff_beyond", "first_beyond", "last_beyond")})
+        v.check("both guard lines intact",
+                f.get("head_guard_ok") == "true" and f.get("tail_guard_ok") == "true")
     return v
 
 

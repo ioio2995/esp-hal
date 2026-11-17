@@ -80,7 +80,7 @@ therefore starts a fresh C6 session. Only the flash prefix covered by the images
 | H0 | Identify, back up, program | Chip and flash size equal the parameters; the existing table is recorded (blank or erased flash yields no valid table and is accepted; a valid table is never overwritten without `allow_overwrite_valid_table`); two reads of the region to write are identical and, if configured, match the historical backup, otherwise no write; programming has an independent `flash.read` equal to the full image, then the table read from the board must equal the image's table; no erase. |
 | H1 | 64-byte round trip, three fresh sessions | Enumeration; P4->C6 and C6->P4 payloads compared byte for byte on both sides (`0..63` ramp, echoed as in the public example); credit 1 and length 64 in every session; three C6 reboots. |
 | H2 | Reuse in one session | Three round trips without reset or re-enumeration; the pattern changes with every packet and the response is independent of the request; credits 1,2,3 and cumulative length 64,128,192; host consumed exactly 64 bytes and one credit per round; no credit appears without a re-armed resource; state returns to `BusExposed` between directions. |
-| H3 | 65-byte C6 -> P4 | Allocation of 128 bytes, exactly 65 published and read with a CMD53 of count 65; length announced 65, received 65, each byte compared; bytes past the word-rounded length are observed. |
+| H3 | 65-byte C6 -> P4 | Allocation of 128 bytes, exactly 65 published and read with a CMD53 of count 65; length announced 65, received 65, each byte compared. The host buffer sits between two guard lines and is written back to memory (explicit cache write-back, built-in check that the chip reports cached memory) before the DMA; afterwards every byte past the 68-byte word-rounded descriptor size must still be 0xff and both guards intact. Bytes 65..67 are an observation. Everything is logged (`tail_check`, `tail_dump`). |
 | H4 | Cancel a wait, then resume (both directions) | A real wait is started and cancelled by timeout; the state stays armed, the descriptor word is exactly what it was before the wait and still DMA-owned, no completion or fault event is pending, no extra credit or length; `IOR1` is declared only afterwards (so the slave's own log proves cancellation precedes the host transfer; the host's wait duration is not an assertion); the resumed wait completes with the exact content. A transmit descriptor is armed with EOF already set (end of packet): that bit is not a completion event. |
 | H5 | Stop an unused receive | Restitution refused while DMA is active; `disable_bus()` result and PARK observed; restitution only after confirmed stop; state `SessionInvalidated`; `enable_bus()` refuses the instance; the host sees the bus released and consumed nothing. |
 | H6 | Stop an unconsumed transmit | Same contract, with the published length 64 still visible to the host before the stop. |
@@ -89,6 +89,15 @@ therefore starts a fresh C6 session. Only the flash prefix covered by the images
 If the stop times out in H5 or H6 the firmware verifies that restitution is still refused,
 prints `stop_failed|...|allocations_retained=true` and reports a failure; it never forces
 recovery.
+
+### H3: the tail of the host buffer
+
+Run 12 (a0008d96) failed H3 on a tail guard: the 65 useful bytes matched, but a byte at index 68
+was not 0xff. The guard did not write the pre-filled buffer back before the DMA while the read
+path invalidates the cache lines of the transfer afterwards, so a stale line may have brought old
+RAM content back: that FAIL stays recorded, its origin is undetermined. The diagnostic above
+separates the 65 useful bytes, the 68-byte descriptor and the 128 allocated bytes, and does not
+treat a burst as a justification for writing beyond the descriptor.
 
 ### H3 and the host API
 
