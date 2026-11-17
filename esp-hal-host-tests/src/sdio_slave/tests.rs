@@ -225,3 +225,28 @@ fn pin_configuration_never_reopens_an_active_or_invalidated_session() {
         }
     }
 }
+
+#[test]
+fn highspeed_bits_are_the_documented_ones() {
+    // ESP32-C6 TRM chapter 34, HINF_CFG_DATA1_REG: HIGHSPEED_ENABLE is bit 2, HIGHSPEED_MODE bit 3.
+    assert_eq!(CFG_DATA1_HIGHSPEED_ENABLE, 0b0100);
+    assert_eq!(CFG_DATA1_HIGHSPEED_MODE, 0b1000);
+}
+
+#[test]
+fn highspeed_is_advertised_only_by_the_enable_bit() {
+    assert!(!highspeed_advertised(0));
+    assert!(highspeed_advertised(CFG_DATA1_HIGHSPEED_ENABLE));
+    // the read-only mode bit and the neighbours are not an advertisement
+    assert!(!highspeed_advertised(CFG_DATA1_HIGHSPEED_MODE));
+    assert!(!highspeed_advertised(!CFG_DATA1_HIGHSPEED_ENABLE));
+    assert!(highspeed_advertised(u32::MAX));
+}
+
+#[test]
+fn highspeed_is_selected_only_by_the_mode_bit() {
+    assert!(!highspeed_selected(0));
+    assert!(highspeed_selected(CFG_DATA1_HIGHSPEED_MODE));
+    assert!(!highspeed_selected(CFG_DATA1_HIGHSPEED_ENABLE));
+    assert!(!highspeed_selected(!CFG_DATA1_HIGHSPEED_MODE));
+}
