@@ -260,13 +260,14 @@ struct GhFile {
 
 /// Use the `gh` CLI to fetch the body, labels, and changed files of a PR.
 fn fetch_pr_info(pr_number: u64) -> Result<PrInfo> {
+    let repo = std::env::var("GITHUB_REPOSITORY").unwrap_or_else(|_| UPSTREAM_REPO.into());
     let output = Command::new("gh")
         .args([
             "pr",
             "view",
             &pr_number.to_string(),
             "--repo",
-            UPSTREAM_REPO,
+            &repo,
             "--json",
             "body,labels,files",
         ])
