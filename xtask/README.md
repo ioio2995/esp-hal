@@ -145,6 +145,14 @@ The standard `plan` → `execute-plan` → `publish-plan` → `post-release` flo
 works from a backport branch — the tooling auto-detects it, scopes to the
 single backport package, and forces Patch bumps. No `--allow-non-main` needed.
 
+## API baselines
+
+`cargo xcheck semver-check download-baselines` reads release assets from
+`API_BASELINE_REPOSITORY`, or from `GITHUB_REPOSITORY` when no override is set.
+Outside GitHub Actions, it defaults to `esp-rs/esp-hal`. The reusable CI workflow
+compares against the upstream baselines by default. A repository variable named
+`API_BASELINE_REPOSITORY` selects another baseline repository for that workflow.
+
 ## Host tests
 
 `cargo xtask host-tests` runs host-side unit tests. CI invokes it for every

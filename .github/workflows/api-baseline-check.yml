@@ -12,6 +12,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  API_BASELINE_REPOSITORY: ${{ vars.API_BASELINE_REPOSITORY || 'esp-rs/esp-hal' }}
 
 jobs:
   baseline-check:

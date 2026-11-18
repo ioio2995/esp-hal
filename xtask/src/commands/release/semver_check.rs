@@ -242,8 +242,9 @@ pub mod checker {
                         log::info!(
                             "Attempting to download from GitHub release asset: {asset_name}"
                         );
-                        let repo = std::env::var("GITHUB_REPOSITORY")
-                            .unwrap_or_else(|_| "esp-rs/esp-hal".to_string());
+                        let repo = std::env::var("API_BASELINE_REPOSITORY")
+                            .or_else(|_| std::env::var("GITHUB_REPOSITORY"))
+                            .unwrap_or_else(|_| crate::UPSTREAM_REPO.into());
                         if try_download_from_release(&package_path, asset_name, &repo)? {
                             log::info!(
                                 "Successfully downloaded baselines from release asset {asset_name}"
