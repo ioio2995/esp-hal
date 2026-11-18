@@ -572,6 +572,10 @@ jobs:
   hil:
     needs: [calculate, merge-freeze-gate]
     if: needs.calculate.outputs.run-hil == 'true'
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
     uses: ./.github/workflows/hil.yml
     with:
       chips: all
