@@ -175,7 +175,7 @@ jobs:
   esp-hal:
     needs: calculate
     if: needs.calculate.outputs.run-build == 'true'
-    runs-on: macos-m1-self-hosted
+    runs-on: ${{ github.repository == 'esp-rs/esp-hal' && 'macos-m1-self-hosted' || 'ubuntu-latest' }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CI: 1
@@ -572,6 +572,10 @@ jobs:
   hil:
     needs: [calculate, merge-freeze-gate]
     if: needs.calculate.outputs.run-hil == 'true'
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
     uses: ./.github/workflows/hil.yml
     with:
       chips: all
